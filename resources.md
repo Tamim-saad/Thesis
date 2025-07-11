@@ -1,8 +1,8 @@
-# 📚 Research Resources & References
+# Research Resources & References
 
-## 🎯 **Core Research Papers**
+## Core Research Papers
 
-### **Point Cloud Deep Learning**
+### Point Cloud Deep Learning
 1. **PointNet (CVPR 2017)**
    - Title: "PointNet: Deep Learning on Point Sets for 3D Classification and Segmentation"
    - Authors: Charles R. Qi, Hao Su, Kaichun Mo, Leonidas J. Guibas
@@ -21,7 +21,7 @@
    - Link: https://arxiv.org/abs/2012.09164
    - **Relevance:** State-of-the-art attention-based architecture
 
-### **3D CNNs and Voxel Processing**
+### 3D CNNs and Voxel Processing
 4. **VoxNet (IROS 2015)**
    - Title: "VoxNet: A 3D Convolutional Neural Network for Real-Time Object Recognition"
    - Authors: Daniel Maturana, Sebastian Scherer
@@ -34,7 +34,7 @@
    - Link: https://arxiv.org/abs/1406.5670
    - **Relevance:** Comprehensive approach to 3D shape understanding
 
-### **Mesh Processing and Graph Neural Networks**
+### Mesh Processing and Graph Neural Networks
 6. **MeshCNN (SIGGRAPH 2019)**
    - Title: "MeshCNN: A Network with an Edge"
    - Authors: Rana Hanocka, Amir Hertz, Noa Fish, Raja Giryes, Shachar Fleishman, Daniel Cohen-Or
@@ -47,9 +47,9 @@
    - Link: https://arxiv.org/abs/1901.00596
    - **Relevance:** Understanding connectivity in mesh structures
 
-## 🏥 **Medical/Biomechanics Applications**
+## Medical/Biomechanics Applications
 
-### **Bone Analysis and Medical Imaging**
+### Bone Analysis and Medical Imaging
 8. **Bone Structure Analysis (Medical Image Analysis 2020)**
    - Title: "Deep Learning for Bone Mineral Density and T-Score Prediction from Chest X-rays"
    - Authors: Yasuhiko Tachibana, Yusuke Kondo, Yasuhiro Yoshida
@@ -64,9 +64,9 @@
     - Authors: Uwe Wolfram, Heiko Gross
     - **Relevance:** Understanding the biomechanical context
 
-## 🔧 **Technical Implementation Resources**
+## Technical Implementation Resources
 
-### **PyTorch Tutorials and Documentation**
+### PyTorch Tutorials and Documentation
 11. **PyTorch 3D (Facebook Research)**
     - Link: https://pytorch3d.org/
     - **Use:** Advanced 3D computer vision operations
@@ -82,7 +82,7 @@
     - **Use:** Point cloud processing and visualization
     - **Components:** I/O, preprocessing, visualization tools
 
-### **Datasets for Benchmarking**
+### Datasets for Benchmarking
 14. **ModelNet40**
     - Link: https://modelnet.cs.princeton.edu/
     - **Use:** Standard benchmark for 3D shape classification
@@ -93,9 +93,9 @@
     - **Use:** Large-scale 3D shape repository
     - **Relevance:** Transfer learning and generalization studies
 
-## 📊 **Evaluation and Metrics**
+## Evaluation and Metrics
 
-### **Point Cloud Distance Metrics**
+### Point Cloud Distance Metrics
 16. **Chamfer Distance Implementation**
     - Repository: https://github.com/chrdiller/pyTorchChamferDistance
     - **Use:** Primary reconstruction loss function
@@ -106,9 +106,9 @@
     - Link: https://arxiv.org/abs/1707.02392
     - **Use:** Alternative distance metric for point clouds
 
-## 🛠️ **Software Tools and Libraries**
+## Software Tools and Libraries
 
-### **ANSYS Integration**
+### ANSYS Integration
 18. **PyAnsys**
     - Link: https://docs.pyansys.com/
     - **Use:** Python interface for ANSYS products
@@ -118,7 +118,7 @@
     - Link: https://ansyshelp.ansys.com/
     - **Use:** Understanding CDB file format and NBLOCK structure
 
-### **Visualization and Analysis**
+### Visualization and Analysis
 20. **Plotly 3D Visualization**
     - Link: https://plotly.com/python/3d-charts/
     - **Use:** Interactive 3D plotting and exploration
@@ -128,9 +128,9 @@
     - Link: https://matplotlib.org/stable/tutorials/toolkits/mplot3d.html
     - **Use:** Static 3D visualization and publication-ready figures
 
-## 🎓 **Academic Resources**
+## Academic Resources
 
-### **Conferences and Venues**
+### Conferences and Venues
 22. **MICCAI (Medical Image Computing and Computer-Assisted Intervention)**
     - Link: https://www.miccai.org/
     - **Relevance:** Premier venue for medical imaging and ML
@@ -141,7 +141,7 @@
 24. **NeurIPS Machine Learning Conference**
     - **Relevance:** Cutting-edge ML research and methodologies
 
-### **Journals**
+### Journals
 25. **Medical Image Analysis (Elsevier)**
     - **Scope:** Medical imaging, computer vision, machine learning
     - **Impact Factor:** 8.880 (2022)
@@ -154,9 +154,9 @@
     - **Scope:** Computational methods in biomechanics
     - **Relevance:** Bridge between engineering and medical applications
 
-## 🔬 **Research Groups and Labs**
+## Research Groups and Labs
 
-### **Leading Research Groups**
+### Leading Research Groups
 28. **Stanford Geometry Lab**
     - Lead: Leonidas Guibas
     - Focus: Geometric deep learning, point cloud processing
@@ -170,9 +170,9 @@
     - Focus: PyTorch3D development, 3D computer vision
     - Resources: Open-source tools and pre-trained models
 
-## 📱 **Online Courses and Tutorials**
+## Online Courses and Tutorials
 
-### **Deep Learning for 3D Data**
+### Deep Learning for 3D Data
 31. **CS231A: Computer Vision (Stanford)**
     - Link: http://web.stanford.edu/class/cs231a/
     - **Topics:** 3D vision, point cloud processing, depth estimation
@@ -181,14 +181,14 @@
     - **Content:** Practical implementations and tutorials
     - **Relevance:** Hands-on learning for point cloud processing
 
-### **Biomechanics and FEA**
+### Biomechanics and FEA
 33. **Introduction to Finite Element Analysis (Coursera)**
     - **Provider:** University of Michigan
     - **Relevance:** Understanding FEA fundamentals
 
-## 🤝 **Community and Forums**
+## Community and Forums
 
-### **Technical Discussion Platforms**
+### Technical Discussion Platforms
 34. **PyTorch Discuss**
     - Link: https://discuss.pytorch.org/
     - **Use:** Technical questions and community support
@@ -202,9 +202,9 @@
     - r/computervision
     - r/bioengineering
 
-## 📁 **Code Repositories and Examples**
+## Code Repositories and Examples
 
-### **Implementation Examples**
+### Implementation Examples
 37. **PointNet PyTorch Implementation**
     - Repository: https://github.com/yanx27/Pointnet_Pointnet2_pytorch
     - **Features:** Clean implementation, training scripts, evaluation
@@ -217,9 +217,9 @@
     - Repository: https://github.com/perone/medicaltorch
     - **Focus:** Medical image analysis with PyTorch
 
-## 🎯 **Specific to Your Research**
+## Specific to Your Research
 
-### **ANSYS and Mesh Processing**
+### ANSYS and Mesh Processing
 40. **ANSYS CDB File Format Documentation**
     - **Source:** ANSYS Technical Documentation
     - **Content:** Detailed NBLOCK format specification
@@ -234,18 +234,14 @@
 
 ---
 
-## 📧 **Contact Information for Collaboration**
+## Contact Information for Collaboration
 
-### **Potential Collaborators**
+### Potential Collaborators
 - **Medical Imaging Researchers:** MICCAI community members
 - **Biomechanics Experts:** University bioengineering departments
 - **ANSYS Developers:** PyAnsys community and technical support
 
-### **Academic Networking**
+### Academic Networking
 - **LinkedIn Academic Groups:** 3D Computer Vision, Medical Imaging AI
 - **ResearchGate:** Follow researchers in related fields
 - **Google Scholar:** Set up alerts for relevant publications
-
----
-
-*This comprehensive resource list provides both foundational knowledge and cutting-edge developments relevant to your thesis research. Use these resources to deepen your understanding, validate your approach, and discover new research directions.*
