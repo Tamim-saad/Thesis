@@ -34,51 +34,128 @@ References:
 """
 
 # ============================================================
-# SECTION 0: ENVIRONMENT SETUP
+# SECTION 0: ENVIRONMENT SETUP (Auto-detect platform)
 # ============================================================
-# Uncomment for Google Colab:
-# !pip install ansys-mapdl-reader pyvista vtk plotly tetgen -q
-# !apt-get install -y xvfb libgl1-mesa-glx -q 2>/dev/null
-# import os; os.environ['PYVISTA_OFF_SCREEN'] = 'true'
+import os, sys, subprocess
+
+# Detect platform
+IN_COLAB = 'google.colab' in sys.modules or os.path.exists('/content')
+IN_KAGGLE = os.path.exists('/kaggle')
+IN_CLOUD = IN_COLAB or IN_KAGGLE
+
+if IN_COLAB:
+    print('☁️ Google Colab detected — installing dependencies...')
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q',
+                           'ansys-mapdl-reader', 'pyvista', 'vtk', 'plotly',
+                           'tetgen', 'seaborn', 'scikit-learn'])
+    # Mount Google Drive for data access
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive', force_remount=False)
+        print('  ✅ Google Drive mounted')
+    except Exception as e:
+        print(f'  ⚠️ Drive mount failed: {e}')
+    # PyVista off-screen rendering (Colab has no display)
+    os.environ['PYVISTA_OFF_SCREEN'] = 'true'
+    os.environ['PYVISTA_USE_PANEL'] = 'false'
+
+elif IN_KAGGLE:
+    print('☁️ Kaggle detected — installing dependencies...')
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q',
+                           'ansys-mapdl-reader', 'pyvista', 'vtk',
+                           'tetgen'])
+    os.environ['PYVISTA_OFF_SCREEN'] = 'true'
+    os.environ['PYVISTA_USE_PANEL'] = 'false'
+
+else:
+    print('💻 Local environment detected')
 
 # ============================================================
 # SECTION 1: IMPORTS
 # ============================================================
 import numpy as np
 import pandas as pd
+import matplotlib
+# Use non-interactive backend in cloud environments (prevents display errors)
+if IN_CLOUD:
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import seaborn as sns
-import os, glob, re, warnings, time
+import glob, re, warnings, time
 from pathlib import Path
 from collections import Counter, defaultdict
 
 warnings.filterwarnings('ignore')
 
-# Optional visualization libraries
-try:
-    import pyvista as pv
-    pv.set_plot_theme('document')
-    HAS_PYVISTA = True
-except ImportError:
-    HAS_PYVISTA = False
-
+# Plotly — set renderer for notebook environments
 try:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     HAS_PLOTLY = True
+    if IN_COLAB:
+        import plotly.io as pio
+        pio.renderers.default = 'colab'
+    elif IN_KAGGLE:
+        import plotly.io as pio
+        pio.renderers.default = 'notebook'
 except ImportError:
     HAS_PLOTLY = False
 
-print("=" * 60)
-print("🦴 AI-Based Tetrahedral Mesh Generation for Hard Tissue")
-print("=" * 60)
+# PyVista
+try:
+    import pyvista as pv
+    if IN_CLOUD:
+        pv.start_xvfb()  # Virtual framebuffer for headless rendering
+    pv.set_plot_theme('document')
+    HAS_PYVISTA = True
+except (ImportError, OSError):
+    HAS_PYVISTA = False
+
+print('=' * 60)
+print('🦴 AI-Based Tetrahedral Mesh Generation for Hard Tissue')
+print('=' * 60)
+print(f'  Platform: {"Colab" if IN_COLAB else "Kaggle" if IN_KAGGLE else "Local"}')
+print(f'  PyVista: {"✅" if HAS_PYVISTA else "❌"}')
+print(f'  Plotly: {"✅" if HAS_PLOTLY else "❌"}')
 
 # ============================================================
-# SECTION 2: CONFIGURATION
+# SECTION 2: CONFIGURATION (Auto-detect data directory)
 # ============================================================
+def _auto_detect_data_dir():
+    """Find CDB data directory automatically based on platform."""
+    candidates = [
+        # Colab — user uploads to Drive
+        '/content/drive/MyDrive/Thesis/Data',
+        '/content/drive/MyDrive/thesis/4_bonemat_cdb_files',
+        '/content/drive/MyDrive/4_bonemat_cdb_files',
+        # Kaggle — user creates a dataset
+        '/kaggle/input/femur-cdb-files',
+        '/kaggle/input/femur-cdb-files/4_bonemat_cdb_files',
+        '/kaggle/input/bonemat-cdb-files',
+        # Local — common paths
+        './4_bonemat_cdb_files',
+        '../4_bonemat_cdb_files',
+        os.path.join(os.path.dirname(os.path.abspath('.')), '4_bonemat_cdb_files'),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            cdb_count = len(glob.glob(os.path.join(path, '*.cdb')))
+            if cdb_count > 0:
+                print(f'  📂 Data found: {path} ({cdb_count} CDB files)')
+                return path
+    # Fallback — user must set manually
+    print('  ⚠️ Data directory not found automatically.')
+    print('  Set CONFIG["data_dir"] to the folder containing *.cdb files.')
+    if IN_COLAB:
+        return '/content/drive/MyDrive/Thesis/Data'
+    elif IN_KAGGLE:
+        return '/kaggle/input/femur-cdb-files'
+    else:
+        return './4_bonemat_cdb_files'
+
 CONFIG = {
-    'data_dir': '/content/drive/MyDrive/Thesis/Data',
+    'data_dir': _auto_detect_data_dir(),
     # FEA quality thresholds (ANSYS standard)
     'ar_good': 3.0, 'ar_poor': 10.0,
     'sj_good': 0.5, 'sj_poor': 0.2,
@@ -1844,12 +1921,7 @@ def run_pipeline(skip_training=False):
     print(f"  Surface pts: {MODEL_CONFIG['n_surface_pts']}")
     print(f"  Interior pts: {MODEL_CONFIG['n_interior_pts']}")
 
-    try:
-        from google.colab import drive
-        drive.mount('/content/drive')
-    except ImportError:
-        pass
-
+    # Drive mount already handled in Section 0 (auto-detect)
     # ── PHASE 1: Parse & Analyze ──
     print("\n📂 PHASE 1: Parsing CDB files")
     reader = CDBFileReader()
