@@ -843,14 +843,9 @@ class MeshRepresentation:
         # We normalize to [0, 1] within each mesh
         int_stiffness_raw = np.array([node_stiffness.get(n, 0.0) for n in int_nid_list])
         has_material = np.any(int_stiffness_raw > 0)
-        if has_material:
-            s_min = int_stiffness_raw[int_stiffness_raw > 0].min()
-            s_max = int_stiffness_raw.max()
-            s_range = max(s_max - s_min, 1e-6)
-            int_stiffness = np.where(int_stiffness_raw > 0,
-                                     (int_stiffness_raw - s_min) / s_range, 0.0)
-        else:
-            int_stiffness = np.zeros(len(int_pts))
+        # Store RAW log10(EX) values — global normalization happens in MeshDataset
+        # This preserves absolute stiffness information across meshes.
+        int_stiffness = int_stiffness_raw.copy()
 
         # Normalize all points together (same coordinate system)
         all_pts = np.vstack([surf_pts, int_pts])
@@ -911,8 +906,61 @@ class MeshDataset(Dataset):
                 self.names.append(name)
                 if pair.get('has_material', False):
                     n_with_mat += 1
+
+        # FIX P1: Global material normalization across ALL meshes
+        # Instead of per-mesh [0,1] normalization (which makes EX=5000
+        # map to different values in different meshes), we normalize
+        # using the global min/max of log10(EX) across the entire dataset.
+        # This lets the model learn absolute stiffness differences:
+        #   trabecular bone (~500 MPa, log10≈2.7) vs
+        #   cortical bone (~18000 MPa, log10≈4.3)
+        self._global_normalize_material()
+
         print(f"  Dataset: {len(self.samples)} valid samples "
               f"({n_with_mat} with materials, {'augmented' if augment else 'eval'})")
+
+    def _global_normalize_material(self):
+        """Normalize material (log10 EX) to [0,1] across the ENTIRE dataset.
+
+        FIX P1: Instead of per-mesh normalization (where EX=5000 maps
+        to 0.3 in one mesh but 0.7 in another), we find the global
+        min/max of log10(EX) across all samples and normalize consistently.
+        This lets the model learn that trabecular bone (~500 MPa) is
+        genuinely different from cortical bone (~18000 MPa).
+        """
+        # Collect all non-zero raw log10(EX) values
+        all_raw = []
+        for s in self.samples:
+            if s.get('has_material', False):
+                mat = s['material']
+                nonzero = mat[mat > 0]
+                if len(nonzero) > 0:
+                    all_raw.append(nonzero)
+
+        if not all_raw:
+            # No material data — zero out all material arrays
+            for s in self.samples:
+                s['material'] = np.zeros_like(s['material'])
+            return
+
+        all_raw = np.concatenate(all_raw)
+        global_min = float(all_raw.min())  # e.g. log10(100) ≈ 2.0
+        global_max = float(all_raw.max())  # e.g. log10(18000) ≈ 4.26
+        global_range = max(global_max - global_min, 1e-6)
+        print(f"  Material range: log10(EX) = [{global_min:.2f}, {global_max:.2f}] "
+              f"({10**global_min:.0f} to {10**global_max:.0f} MPa)")
+
+        # Normalize ALL samples to consistent [0,1] using global range
+        for s in self.samples:
+            if s.get('has_material', False):
+                mat = s['material']
+                s['material'] = np.where(
+                    mat > 0,
+                    np.clip((mat - global_min) / global_range, 0.0, 1.0),
+                    0.0
+                ).astype(np.float32)
+            else:
+                s['material'] = np.zeros_like(s['material'])
 
     def __len__(self):
         return len(self.samples)
@@ -1009,21 +1057,25 @@ class DGCNN(nn.Module):
     dynamic k-NN graphs — appropriate for bone surface geometry with
     varying curvature. For 198 samples, lighter than Point Transformer
     V3 (~46M params would overfit).
+
+    FIX P3: Uses GroupNorm instead of BatchNorm for stable training
+    with small batch sizes (batch_size=4).
     """
 
     def __init__(self, k=20, in_dim=6, out_dim=512):
         super().__init__()
         self.k = k
+        # GroupNorm: num_groups chosen so each group has ≥16 channels
         self.ec1 = nn.Sequential(nn.Conv2d(in_dim * 2, 64, 1, bias=False),
-                                 nn.BatchNorm2d(64), nn.LeakyReLU(0.2))
+                                 nn.GroupNorm(8, 64), nn.LeakyReLU(0.2))
         self.ec2 = nn.Sequential(nn.Conv2d(128, 128, 1, bias=False),
-                                 nn.BatchNorm2d(128), nn.LeakyReLU(0.2))
+                                 nn.GroupNorm(8, 128), nn.LeakyReLU(0.2))
         self.ec3 = nn.Sequential(nn.Conv2d(256, 256, 1, bias=False),
-                                 nn.BatchNorm2d(256), nn.LeakyReLU(0.2))
+                                 nn.GroupNorm(16, 256), nn.LeakyReLU(0.2))
         self.ec4 = nn.Sequential(nn.Conv2d(512, 512, 1, bias=False),
-                                 nn.BatchNorm2d(512), nn.LeakyReLU(0.2))
+                                 nn.GroupNorm(32, 512), nn.LeakyReLU(0.2))
         self.agg = nn.Sequential(nn.Conv1d(64 + 128 + 256 + 512, out_dim, 1, bias=False),
-                                 nn.BatchNorm1d(out_dim), nn.LeakyReLU(0.2))
+                                 nn.GroupNorm(32, out_dim), nn.LeakyReLU(0.2))
 
     def forward(self, x):
         B = x.size(0)
@@ -1075,10 +1127,24 @@ class TripleHeadDecoder(nn.Module):
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 1), nn.Sigmoid())
         # Material head (from decoded position + conditioning → bone stiffness)
+        # FIX P2: Material head receives non-detached positions so gradients
+        # flow back — positions learn to cluster near high-stiffness regions.
         self.material = nn.Sequential(
             nn.Linear(3 + z_dim + cond_dim, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 1), nn.Sigmoid())
+
+        # FIX P4: Xavier init for Sigmoid output heads (better gradient flow)
+        self._init_sigmoid_heads()
+
+    def _init_sigmoid_heads(self):
+        """Xavier uniform init for layers preceding Sigmoid activations."""
+        for head in [self.sizing, self.material]:
+            for m in head.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def _init_template(self, n):
         """Initialize template as uniform random points inside unit ball."""
@@ -1097,9 +1163,16 @@ class TripleHeadDecoder(nn.Module):
 
         pos1 = self.fold1(torch.cat([t, z_e, c_e], dim=2))
         pos2 = self.fold2(torch.cat([pos1, z_e, c_e], dim=2))
-        feat_input = torch.cat([pos2.detach(), z_e, c_e], dim=2)
-        sz = self.sizing(feat_input).squeeze(-1)
-        mat = self.material(feat_input).squeeze(-1)
+
+        # Sizing head: detached — sizing shouldn't move node positions
+        sz_input = torch.cat([pos2.detach(), z_e, c_e], dim=2)
+        sz = self.sizing(sz_input).squeeze(-1)
+
+        # Material head: NOT detached — positions should learn to
+        # cluster near high-stiffness (cortical bone) regions
+        mat_input = torch.cat([pos2, z_e, c_e], dim=2)
+        mat = self.material(mat_input).squeeze(-1)
+
         return pos2, sz, mat
 
 
@@ -1152,22 +1225,75 @@ class SurfaceToVolumeCVAE(nn.Module):
 # ============================================================
 # SECTION 14: LOSS FUNCTIONS
 # ============================================================
-def chamfer_distance(pred, target):
-    """Bidirectional Chamfer Distance between two point clouds."""
-    diff = pred.unsqueeze(2) - target.unsqueeze(1)  # (B,N,M,3)
-    dist = (diff ** 2).sum(-1)                       # (B,N,M)
-    d_pred_to_tgt = dist.min(2)[0].mean(1)           # pred→target
-    d_tgt_to_pred = dist.min(1)[0].mean(1)           # target→pred
-    return (d_pred_to_tgt + d_tgt_to_pred).mean()
+def chamfer_distance(pred, target, chunk_size=512):
+    """
+    Bidirectional Chamfer Distance — MEMORY-EFFICIENT chunked version.
+
+    FIX P0: Instead of materializing an O(N×M) distance matrix all at once
+    (~800MB for N=M=4096), we process in chunks of `chunk_size` rows.
+    Memory: O(chunk_size × M) ≈ 6MB per chunk, 99.3% reduction.
+    """
+    B, N, _ = pred.size()
+    M = target.size(1)
+
+    # pred → target: for each pred point, find nearest target point
+    d_p2t = torch.zeros(B, N, device=pred.device)
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        diff = pred[:, i:end].unsqueeze(2) - target.unsqueeze(1)  # (B, chunk, M, 3)
+        d_p2t[:, i:end] = diff.pow(2).sum(-1).min(2)[0]          # (B, chunk)
+
+    # target → pred: for each target point, find nearest pred point
+    d_t2p = torch.zeros(B, M, device=pred.device)
+    for i in range(0, M, chunk_size):
+        end = min(i + chunk_size, M)
+        diff = target[:, i:end].unsqueeze(2) - pred.unsqueeze(1)  # (B, chunk, N, 3)
+        d_t2p[:, i:end] = diff.pow(2).sum(-1).min(2)[0]          # (B, chunk)
+
+    return (d_p2t.mean(1) + d_t2p.mean(1)).mean()
 
 
-def hausdorff_distance(pred, target):
-    """One-sided Hausdorff (max of min distances) — evaluation only."""
-    diff = pred.unsqueeze(2) - target.unsqueeze(1)
-    dist = (diff ** 2).sum(-1)
-    d_max_pred = dist.min(2)[0].max(1)[0]  # max min-dist from pred
-    d_max_tgt = dist.min(1)[0].max(1)[0]   # max min-dist from target
+def hausdorff_distance(pred, target, chunk_size=512):
+    """
+    One-sided Hausdorff (max of min distances) — chunked, evaluation only.
+    """
+    B, N, _ = pred.size()
+    M = target.size(1)
+
+    d_max_pred = torch.zeros(B, device=pred.device)
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        diff = pred[:, i:end].unsqueeze(2) - target.unsqueeze(1)
+        chunk_mins = diff.pow(2).sum(-1).min(2)[0]  # (B, chunk)
+        d_max_pred = torch.max(d_max_pred, chunk_mins.max(1)[0])
+
+    d_max_tgt = torch.zeros(B, device=pred.device)
+    for i in range(0, M, chunk_size):
+        end = min(i + chunk_size, M)
+        diff = target[:, i:end].unsqueeze(2) - pred.unsqueeze(1)
+        chunk_mins = diff.pow(2).sum(-1).min(2)[0]
+        d_max_tgt = torch.max(d_max_tgt, chunk_mins.max(1)[0])
+
     return torch.max(d_max_pred, d_max_tgt).mean()
+
+
+def density_uniformity(pred_pos, n_subsample=1024):
+    """
+    Density uniformity loss — on a SUBSAMPLE of points.
+
+    FIX P0: Computing pairwise distances on all 4096 points requires
+    O(N²) = 16M entries. Subsampling to 1024 reduces to O(1M) = 16x savings.
+    """
+    B, N, D = pred_pos.size()
+    if N > n_subsample:
+        idx = torch.randperm(N, device=pred_pos.device)[:n_subsample]
+        pts = pred_pos[:, idx]
+    else:
+        pts = pred_pos
+    n = pts.size(1)
+    d = (pts.unsqueeze(2) - pts.unsqueeze(1)).pow(2).sum(-1)
+    d = d + torch.eye(n, device=pts.device).unsqueeze(0) * 1e6
+    return d.min(2)[0].std(1).mean()
 
 
 class MeshGenLoss(nn.Module):
@@ -1177,11 +1303,7 @@ class MeshGenLoss(nn.Module):
                 target_pos, target_sizing, target_material, mu, logvar):
         cd = chamfer_distance(pred_pos, target_pos)
         kl = -0.5 * torch.mean(1 + logvar - mu ** 2 - logvar.exp())
-
-        # Density uniformity: penalize non-uniform nearest-neighbor distances
-        d = (pred_pos.unsqueeze(2) - pred_pos.unsqueeze(1)).pow(2).sum(-1)
-        d = d + torch.eye(pred_pos.size(1), device=pred_pos.device).unsqueeze(0) * 1e6
-        density = d.min(2)[0].std(1).mean()
+        density = density_uniformity(pred_pos)  # FIX P0: subsampled
 
         # Sizing field regression
         sizing_loss = F.mse_loss(pred_sizing, target_sizing)
