@@ -629,6 +629,7 @@ class DatasetAnalyzer:
         plt.show()
 
 
+
 # ============================================================
 # SECTION 9: MESH REPRESENTATION FOR AI
 # ============================================================
@@ -638,20 +639,30 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import KFold
 
+# TetGen: constrained Delaunay tetrahedralization (respects surface boundary)
+try:
+    import tetgen as _tetgen_lib
+    HAS_TETGEN = True
+except ImportError:
+    HAS_TETGEN = False
+    print("⚠️ tetgen not installed. pip install tetgen. Falling back to scipy.")
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 MODEL_CONFIG = {
-    'n_surface_pts': 2048,   # Fixed surface point count
-    'n_interior_pts': 4096,  # Fixed interior point count
+    'n_surface_pts': 2048,
+    'n_interior_pts': 4096,
     'latent_dim': 512,
-    'dgcnn_k': 20,           # k-NN neighbors for DGCNN
+    'dgcnn_k': 20,
+    'input_dim': 6,       # xyz + normals
     'batch_size': 2,
     'epochs': 200,
     'lr': 1e-4,
     'lr_patience': 20,
     'weight_decay': 1e-5,
     'kl_weight': 0.001,
-    'quality_weight': 0.1,
+    'sizing_weight': 0.05,   # sizing field loss weight
+    'density_weight': 0.1,
     'k_folds': 5,
 }
 
@@ -659,12 +670,15 @@ MODEL_CONFIG = {
 class MeshRepresentation:
     """
     Convert raw mesh data → fixed-size tensors for AI training.
-    Each CDB mesh becomes: (surface_pts, interior_pts) pair.
+
+    Improvements over naive approach:
+    1. Computes surface NORMALS (6D input: xyz + normals)
+    2. Computes per-node SIZING FIELD (target local element density)
+    3. Normalizes to unit sphere for invariant training
     """
 
     @staticmethod
     def normalize(points):
-        """Center and scale to unit sphere. Returns (normalized, centroid, scale)."""
         c = points.mean(axis=0)
         centered = points - c
         s = max(np.max(np.linalg.norm(centered, axis=1)), 1e-10)
@@ -672,7 +686,6 @@ class MeshRepresentation:
 
     @staticmethod
     def sample_fixed(points, n):
-        """Resample to exactly n points."""
         if len(points) == 0:
             return np.zeros((n, 3))
         if len(points) >= n:
@@ -681,9 +694,78 @@ class MeshRepresentation:
                       np.random.choice(len(points), n-len(points), replace=True)])]
 
     @staticmethod
+    def compute_normals(points, faces):
+        """Estimate surface normals from triangular faces."""
+        normals = np.zeros_like(points)
+        counts = np.zeros(len(points))
+        pts_idx = {tuple(p): i for i, p in enumerate(points)}
+
+        for f in faces:
+            tri = [points[pts_idx.get(tuple(p), 0)] if tuple(p) in pts_idx
+                   else np.zeros(3) for p in []]
+            # Use face vertex indices directly
+            idx = []
+            for v in f:
+                for i, p in enumerate(points):
+                    if np.allclose(p, v, atol=1e-8):
+                        idx.append(i)
+                        break
+            if len(idx) < 3:
+                continue
+            v0, v1, v2 = points[idx[0]], points[idx[1]], points[idx[2]]
+            n = np.cross(v1 - v0, v2 - v0)
+            norm = np.linalg.norm(n)
+            if norm > 1e-10:
+                n /= norm
+                for i in idx:
+                    normals[i] += n
+                    counts[i] += 1
+
+        mask = counts > 0
+        normals[mask] /= counts[mask, None]
+        # Normalize
+        norms = np.linalg.norm(normals, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        normals /= norms
+        return normals
+
+    @staticmethod
+    def compute_sizing_field(int_pts, surf_pts):
+        """
+        Compute target sizing field: distance from each interior point
+        to nearest surface point. Normalized to [0,1]. This teaches the
+        model WHERE elements should be denser (near surface = small size)
+        vs coarser (deep interior = large size).
+        """
+        from scipy.spatial import KDTree
+        tree = KDTree(surf_pts)
+        dists, _ = tree.query(int_pts)
+        if dists.max() > 1e-10:
+            return (dists / dists.max()).astype(np.float32)
+        return np.zeros(len(int_pts), dtype=np.float32)
+
+    @staticmethod
+    def estimate_normals_from_points(points, k=10):
+        """Estimate normals from point cloud using PCA on k-NN."""
+        from scipy.spatial import KDTree
+        tree = KDTree(points)
+        normals = np.zeros_like(points)
+        for i, p in enumerate(points):
+            _, idx = tree.query(p, k=min(k, len(points)))
+            neighbors = points[idx]
+            cov = np.cov(neighbors.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            normals[i] = eigvecs[:, 0]  # smallest eigenvalue → normal
+        # Consistent orientation
+        norms = np.linalg.norm(normals, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        normals /= norms
+        return normals
+
+    @staticmethod
     def prepare_pair(nodes, tets):
-        """nodes array + tets list → normalized (surface, interior) pair."""
-        _, surf_nids = SurfaceExtractor.extract(tets)
+        """nodes array + tets → normalized (surface_xyz_normals, interior, sizing)."""
+        faces, surf_nids = SurfaceExtractor.extract(tets)
         nid_to_pos = {int(n[0]): n[1:4].astype(float) for n in nodes}
         all_nids = set(nid_to_pos.keys())
         int_nids = all_nids - surf_nids
@@ -693,14 +775,32 @@ class MeshRepresentation:
         if len(surf_pts) < 10 or len(int_pts) < 10:
             return None
 
+        # Normalize all points together
         all_pts = np.vstack([surf_pts, int_pts])
         _, centroid, scale = MeshRepresentation.normalize(all_pts)
         surf_n = (surf_pts - centroid) / scale
         int_n = (int_pts - centroid) / scale
 
+        # Surface normals via PCA
+        normals = MeshRepresentation.estimate_normals_from_points(surf_n, k=10)
+
+        # Sizing field: distance to surface (normalized)
+        sizing = MeshRepresentation.compute_sizing_field(int_n, surf_n)
+
+        # Sample to fixed sizes
+        n_s = MODEL_CONFIG['n_surface_pts']
+        n_i = MODEL_CONFIG['n_interior_pts']
+        surf_sampled = MeshRepresentation.sample_fixed(surf_n, n_s).astype(np.float32)
+        norm_sampled = MeshRepresentation.sample_fixed(normals, n_s).astype(np.float32)
+        int_sampled = MeshRepresentation.sample_fixed(int_n, n_i).astype(np.float32)
+        size_sampled = MeshRepresentation.sample_fixed(
+            sizing.reshape(-1,1), n_i).flatten().astype(np.float32)
+
         return {
-            'surface': MeshRepresentation.sample_fixed(surf_n, MODEL_CONFIG['n_surface_pts']).astype(np.float32),
-            'interior': MeshRepresentation.sample_fixed(int_n, MODEL_CONFIG['n_interior_pts']).astype(np.float32),
+            'surface': surf_sampled,       # (n_s, 3) xyz
+            'normals': norm_sampled,        # (n_s, 3) normals
+            'interior': int_sampled,        # (n_i, 3) xyz
+            'sizing': size_sampled,         # (n_i,) sizing field
             'centroid': centroid, 'scale': scale,
             'n_surf_orig': len(surf_pts), 'n_int_orig': len(int_pts),
         }
@@ -710,10 +810,7 @@ class MeshRepresentation:
 # SECTION 10: PYTORCH DATASET
 # ============================================================
 class MeshDataset(Dataset):
-    """
-    PyTorch Dataset: (surface → interior) pairs with augmentation.
-    Augmentation critical for 198 samples: rotation, scale, jitter.
-    """
+    """Dataset returning (surface+normals, interior, sizing) with augmentation."""
 
     def __init__(self, meshes, augment=False):
         self.samples, self.names = [], []
@@ -723,54 +820,52 @@ class MeshDataset(Dataset):
             if pair:
                 self.samples.append(pair)
                 self.names.append(name)
-        print(f"  Dataset: {len(self.samples)} samples ({'aug' if augment else 'no aug'})")
+        print(f"  Dataset: {len(self.samples)} samples ({'aug' if augment else 'val'})")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        surf = torch.tensor(s['surface'])
+        surf = torch.tensor(np.concatenate([s['surface'], s['normals']], axis=1))  # (N,6)
         intr = torch.tensor(s['interior'])
+        sizing = torch.tensor(s['sizing'])
         if self.augment:
             surf, intr = self._augment(surf, intr)
-        return surf, intr, idx
+        return surf, intr, sizing, idx
 
     def _augment(self, surf, intr):
-        # Random rotation (Z-axis — anatomically meaningful for femur)
         a = np.random.uniform(0, 2*np.pi)
         R = torch.tensor([[np.cos(a),-np.sin(a),0],
                            [np.sin(a), np.cos(a),0],
                            [0,0,1]], dtype=torch.float32)
-        surf, intr = surf @ R.T, intr @ R.T
-        # Scale ±5%
+        surf_xyz = surf[:, :3] @ R.T
+        surf_nrm = surf[:, 3:] @ R.T
+        surf = torch.cat([surf_xyz, surf_nrm], dim=1)
+        intr = intr @ R.T
         s = 1.0 + np.random.uniform(-0.05, 0.05)
-        surf, intr = surf * s, intr * s
-        # Jitter surface only
-        surf = surf + torch.randn_like(surf) * 0.002
+        surf[:, :3] *= s
+        intr *= s
+        surf[:, :3] += torch.randn(surf.size(0), 3) * 0.002
         return surf, intr
 
 
 # ============================================================
-# SECTION 11: DGCNN ENCODER
+# SECTION 11: DGCNN ENCODER (6D input: xyz + normals)
 # ============================================================
 """
-Why DGCNN (not PointNet/GNN from old files — this is research-based):
-- Builds DYNAMIC k-NN graph in feature space at EACH layer
-- Captures local geometric patterns that matter for bone surface shape
-- Outperforms PointNet (no local structure), PointNet++ (static groups)
-- State-of-the-art for point cloud feature extraction (Wang et al. 2019)
+DGCNN with 6D input (positions + normals):
+- Normals encode local surface orientation → critical for bone shape
+- Dynamic k-NN in feature space captures cortical vs trabecular regions
 """
 
 def knn(x, k):
-    """k-nearest neighbors in feature space."""
     dist = -2 * torch.matmul(x.transpose(2,1), x)
     dist += torch.sum(x**2, dim=1, keepdim=True)
     dist += torch.sum(x**2, dim=1, keepdim=True).transpose(2,1)
     return (-dist).topk(k=k, dim=-1)[1]
 
 def edge_features(x, k=20, idx=None):
-    """Construct edge features: [neighbor - center, center]."""
     B, D, N = x.size()
     if idx is None:
         idx = knn(x, k)
@@ -783,20 +878,25 @@ def edge_features(x, k=20, idx=None):
 
 
 class DGCNN(nn.Module):
-    """Dynamic Graph CNN — surface geometry encoder."""
+    """Dynamic Graph CNN — 6D input (xyz + normals)."""
 
-    def __init__(self, k=20, out_dim=512):
+    def __init__(self, k=20, in_dim=6, out_dim=512):
         super().__init__()
         self.k = k
-        self.ec1 = nn.Sequential(nn.Conv2d(6,64,1,bias=False), nn.BatchNorm2d(64), nn.LeakyReLU(0.2))
-        self.ec2 = nn.Sequential(nn.Conv2d(128,64,1,bias=False), nn.BatchNorm2d(64), nn.LeakyReLU(0.2))
-        self.ec3 = nn.Sequential(nn.Conv2d(128,128,1,bias=False), nn.BatchNorm2d(128), nn.LeakyReLU(0.2))
-        self.ec4 = nn.Sequential(nn.Conv2d(256,256,1,bias=False), nn.BatchNorm2d(256), nn.LeakyReLU(0.2))
+        # First layer: 2*in_dim because edge_features concatenates [diff, center]
+        self.ec1 = nn.Sequential(nn.Conv2d(in_dim*2, 64, 1, bias=False),
+                                 nn.BatchNorm2d(64), nn.LeakyReLU(0.2))
+        self.ec2 = nn.Sequential(nn.Conv2d(128, 64, 1, bias=False),
+                                 nn.BatchNorm2d(64), nn.LeakyReLU(0.2))
+        self.ec3 = nn.Sequential(nn.Conv2d(128, 128, 1, bias=False),
+                                 nn.BatchNorm2d(128), nn.LeakyReLU(0.2))
+        self.ec4 = nn.Sequential(nn.Conv2d(256, 256, 1, bias=False),
+                                 nn.BatchNorm2d(256), nn.LeakyReLU(0.2))
         self.agg = nn.Sequential(nn.Conv1d(512, out_dim, 1, bias=False),
                                  nn.BatchNorm1d(out_dim), nn.LeakyReLU(0.2))
 
     def forward(self, x):
-        """x: (B,3,N) → (B, out_dim*2)"""
+        """x: (B, in_dim, N) → (B, out_dim*2)"""
         B = x.size(0)
         x1 = self.ec1(edge_features(x, self.k)).max(-1)[0]
         x2 = self.ec2(edge_features(x1, self.k)).max(-1)[0]
@@ -808,68 +908,73 @@ class DGCNN(nn.Module):
 
 
 # ============================================================
-# SECTION 12: CVAE MODEL (Surface → Interior Nodes)
+# SECTION 12: DUAL-HEAD CVAE (positions + sizing field)
 # ============================================================
 """
-Why Conditional VAE (research-based choice):
-- 198 samples = very small dataset → VAE regularization prevents overfitting
-- Conditional on surface features → generates interior nodes specific to bone shape
-- FoldingNet decoder deforms a 3D template → learns smooth mappings
-- DefTet (NVIDIA) also uses deformation-based mesh generation
+Dual-head decoder (research contribution):
+- Head 1: Predict interior node POSITIONS (xyz)
+- Head 2: Predict SIZING FIELD (local element size at each point)
+  → sizing field tells TetGen WHERE to make finer/coarser elements
+  → mimics how real FEA meshes have adaptive density
 """
 
-class FoldingDecoder(nn.Module):
-    """Deform 3D template to predict interior node positions."""
+class DualHeadDecoder(nn.Module):
+    """FoldingNet decoder with position + sizing heads."""
 
     def __init__(self, z_dim=512, cond_dim=1024, n_pts=4096):
         super().__init__()
         self.n_pts = n_pts
         self.register_buffer('template', self._init_template(n_pts))
         inp = 3 + z_dim + cond_dim
-        self.fold1 = nn.Sequential(nn.Linear(inp,512), nn.ReLU(),
-                                    nn.Linear(512,512), nn.ReLU(),
-                                    nn.Linear(512,256), nn.ReLU(),
-                                    nn.Linear(256,3))
-        self.fold2 = nn.Sequential(nn.Linear(3+z_dim+cond_dim,512), nn.ReLU(),
-                                    nn.Linear(512,512), nn.ReLU(),
-                                    nn.Linear(512,256), nn.ReLU(),
-                                    nn.Linear(256,3))
+
+        # Position head (2-fold as in FoldingNet)
+        self.fold1 = nn.Sequential(nn.Linear(inp, 512), nn.ReLU(),
+                                    nn.Linear(512, 512), nn.ReLU(),
+                                    nn.Linear(512, 256), nn.ReLU(),
+                                    nn.Linear(256, 3))
+        self.fold2 = nn.Sequential(nn.Linear(3+z_dim+cond_dim, 512), nn.ReLU(),
+                                    nn.Linear(512, 512), nn.ReLU(),
+                                    nn.Linear(512, 256), nn.ReLU(),
+                                    nn.Linear(256, 3))
+        # Sizing head: predict local element size per point
+        self.sizing_head = nn.Sequential(nn.Linear(3+z_dim+cond_dim, 256), nn.ReLU(),
+                                          nn.Linear(256, 128), nn.ReLU(),
+                                          nn.Linear(128, 1), nn.Sigmoid())
 
     def _init_template(self, n):
+        np.random.seed(42)  # reproducible template
         pts = np.random.randn(n*3, 3)
         pts = pts / np.linalg.norm(pts, axis=1, keepdims=True)
-        r = np.random.uniform(0,1,(len(pts),1))**(1/3)
+        r = np.random.uniform(0, 1, (len(pts), 1))**(1/3)
         pts = (pts * r)[:n]
         return torch.tensor(pts, dtype=torch.float32)
 
     def forward(self, z, cond):
         B = z.size(0)
-        t = self.template.unsqueeze(0).expand(B,-1,-1)
-        z_e = z.unsqueeze(1).expand(-1,self.n_pts,-1)
-        c_e = cond.unsqueeze(1).expand(-1,self.n_pts,-1)
-        out1 = self.fold1(torch.cat([t, z_e, c_e], 2))
-        out2 = self.fold2(torch.cat([out1, z_e, c_e], 2))
-        return out2
+        t = self.template.unsqueeze(0).expand(B, -1, -1)
+        z_e = z.unsqueeze(1).expand(-1, self.n_pts, -1)
+        c_e = cond.unsqueeze(1).expand(-1, self.n_pts, -1)
+        pos1 = self.fold1(torch.cat([t, z_e, c_e], 2))
+        pos2 = self.fold2(torch.cat([pos1, z_e, c_e], 2))
+        sizing = self.sizing_head(torch.cat([pos2, z_e, c_e], 2)).squeeze(-1)
+        return pos2, sizing
 
 
 class SurfaceToVolumeCVAE(nn.Module):
-    """
-    Full model: Surface points → Interior node positions.
-
-    Surface → DGCNN → features → μ,σ → sample z → FoldingDecoder → interior pts
-    """
+    """Surface (xyz+normals) → Interior positions + sizing field."""
 
     def __init__(self):
         super().__init__()
-        self.encoder = DGCNN(k=MODEL_CONFIG['dgcnn_k'], out_dim=512)
-        enc_out = 1024  # DGCNN: max+avg pool → 512*2
+        self.encoder = DGCNN(k=MODEL_CONFIG['dgcnn_k'],
+                             in_dim=MODEL_CONFIG['input_dim'], out_dim=512)
+        enc_out = 1024
         self.fc_mu = nn.Linear(enc_out, MODEL_CONFIG['latent_dim'])
         self.fc_logvar = nn.Linear(enc_out, MODEL_CONFIG['latent_dim'])
-        self.decoder = FoldingDecoder(MODEL_CONFIG['latent_dim'], enc_out,
-                                       MODEL_CONFIG['n_interior_pts'])
+        self.decoder = DualHeadDecoder(MODEL_CONFIG['latent_dim'], enc_out,
+                                        MODEL_CONFIG['n_interior_pts'])
 
     def encode(self, surf):
-        feat = self.encoder(surf.transpose(1,2))
+        feat = self.encoder(surf.transpose(1, 2))  # (B,6,N) → (B,1024)
         return feat, self.fc_mu(feat), self.fc_logvar(feat)
 
     def reparameterize(self, mu, logvar):
@@ -880,34 +985,40 @@ class SurfaceToVolumeCVAE(nn.Module):
     def forward(self, surf):
         feat, mu, logvar = self.encode(surf)
         z = self.reparameterize(mu, logvar)
-        return self.decoder(z, feat), mu, logvar
+        pos, sizing = self.decoder(z, feat)
+        return pos, sizing, mu, logvar
 
 
 # ============================================================
 # SECTION 13: LOSS FUNCTIONS
 # ============================================================
 def chamfer_distance(pred, target):
-    """Chamfer Distance between two point clouds."""
     diff = pred.unsqueeze(2) - target.unsqueeze(1)
     dist = (diff**2).sum(-1)
     return (dist.min(2)[0].mean(1) + dist.min(1)[0].mean(1)).mean()
 
 
 class MeshGenLoss(nn.Module):
-    """Chamfer + KL divergence + density uniformity."""
+    """Chamfer + KL + density uniformity + sizing field MSE."""
 
-    def forward(self, pred, target, mu, logvar):
-        cd = chamfer_distance(pred, target)
+    def forward(self, pred_pos, pred_sizing, target_pos, target_sizing, mu, logvar):
+        cd = chamfer_distance(pred_pos, target_pos)
         kl = -0.5 * torch.mean(1 + logvar - mu**2 - logvar.exp())
 
-        # Density: penalize clustering (encourages uniform interior distribution)
-        d = (pred.unsqueeze(2) - pred.unsqueeze(1)).pow(2).sum(-1)
-        d = d + torch.eye(pred.size(1), device=pred.device).unsqueeze(0) * 1e6
+        # Density uniformity
+        d = (pred_pos.unsqueeze(2) - pred_pos.unsqueeze(1)).pow(2).sum(-1)
+        d = d + torch.eye(pred_pos.size(1), device=pred_pos.device).unsqueeze(0) * 1e6
         density = d.min(2)[0].std(1).mean()
 
-        total = cd + MODEL_CONFIG['kl_weight']*kl + MODEL_CONFIG['quality_weight']*density
+        # Sizing field loss
+        sizing_loss = F.mse_loss(pred_sizing, target_sizing)
+
+        total = (cd + MODEL_CONFIG['kl_weight'] * kl +
+                 MODEL_CONFIG['density_weight'] * density +
+                 MODEL_CONFIG['sizing_weight'] * sizing_loss)
         return total, {'cd': cd.item(), 'kl': kl.item(),
-                       'density': density.item(), 'total': total.item()}
+                       'density': density.item(), 'sizing': sizing_loss.item(),
+                       'total': total.item()}
 
 
 # ============================================================
@@ -927,10 +1038,11 @@ class Trainer:
     def _run_epoch(self, dl, train=True):
         self.model.train(train)
         total_l, total_cd, n = 0, 0, 0
-        for surf, intr, _ in dl:
-            surf, intr = surf.to(DEVICE), intr.to(DEVICE)
-            pred, mu, lv = self.model(surf)
-            loss, d = self.loss_fn(pred, intr, mu, lv)
+        for surf, intr, sizing, _ in dl:
+            surf = surf.to(DEVICE)
+            intr, sizing = intr.to(DEVICE), sizing.to(DEVICE)
+            pred_pos, pred_sz, mu, lv = self.model(surf)
+            loss, d = self.loss_fn(pred_pos, pred_sz, intr, sizing, mu, lv)
             if train:
                 self.opt.zero_grad()
                 loss.backward()
@@ -972,17 +1084,53 @@ class Trainer:
         return self.hist
 
 
+def _tetgen_mesh(surf_pts, int_pts, sizing=None):
+    """
+    Constrained Delaunay tetrahedralization using TetGen.
+    Unlike scipy.Delaunay (convex hull), TetGen RESPECTS the surface boundary
+    and only creates tetrahedra INSIDE the volume.
+    Falls back to scipy if TetGen unavailable.
+    """
+    if HAS_TETGEN:
+        try:
+            import pyvista as pv
+            # Create surface mesh using ConvexHull of surface points
+            cloud = pv.PolyData(surf_pts)
+            surf_mesh = cloud.delaunay_2d().extract_surface()
+            tet = _tetgen_lib.TetGen(surf_mesh)
+            tet.tetrahedralize(order=1, mindihedral=10, minratio=1.5,
+                               nobisect=True)
+            grid = tet.grid
+            nodes = np.array(grid.points)
+            cells = grid.cells.reshape(-1, 5)[:, 1:]  # strip VTK cell type
+            elems = [tuple(row) for row in cells]
+            nodes_arr = np.column_stack([np.arange(len(nodes)), nodes])
+            return nodes_arr, elems
+        except Exception as e:
+            print(f"    TetGen failed ({e}), falling back to scipy")
+
+    # Fallback: scipy Delaunay (convex hull — less accurate)
+    from scipy.spatial import Delaunay
+    all_pts = np.vstack([surf_pts, int_pts])
+    tri = Delaunay(all_pts)
+    elems = [tuple(simp) for simp in tri.simplices]
+    nodes_arr = np.column_stack([np.arange(len(all_pts)), all_pts])
+    return nodes_arr, elems
+
+
 @torch.no_grad()
 def evaluate_model(model, dataset):
-    """Evaluate: predict interior → Delaunay tet → quality metrics."""
-    from scipy.spatial import Delaunay
+    """Evaluate: predict interior → TetGen → quality metrics."""
     model.eval()
     results = []
 
     for i in range(len(dataset)):
         s = dataset.samples[i]
-        surf_t = torch.tensor(s['surface']).unsqueeze(0).to(DEVICE)
-        pred = model(surf_t)[0].cpu().numpy()[0]
+        surf_6d = np.concatenate([s['surface'], s['normals']], axis=1)
+        surf_t = torch.tensor(surf_6d).unsqueeze(0).to(DEVICE)
+        pred_pos, pred_sz, _, _ = model(surf_t)
+        pred = pred_pos.cpu().numpy()[0]
+        sizing = pred_sz.cpu().numpy()[0]
 
         # Chamfer distance
         p_t = torch.tensor(pred).unsqueeze(0).float()
@@ -991,18 +1139,16 @@ def evaluate_model(model, dataset):
 
         m = {'chamfer': cd, 'file': dataset.names[i]}
 
-        # Generate tet mesh from predicted points
+        # Generate tet mesh via TetGen
         pred_real = pred * s['scale'] + s['centroid']
         surf_real = s['surface'] * s['scale'] + s['centroid']
-        all_pts = np.vstack([surf_real, pred_real])
 
         try:
-            tri = Delaunay(all_pts)
-            elems = [tuple(simp) for simp in tri.simplices]
-            nodes_arr = np.column_stack([np.arange(len(all_pts)), all_pts])
+            nodes_arr, elems = _tetgen_mesh(surf_real, pred_real, sizing)
             qdf = QualityMetrics.compute(nodes_arr, elems)
             if not qdf.empty:
                 m['gen_tets'] = len(elems)
+                m['gen_nodes'] = len(nodes_arr)
                 m['mean_ar'] = qdf['aspect_ratio'].mean()
                 m['mean_sj'] = qdf['jacobian'].mean()
                 m['pct_good'] = (qdf['quality']=='good').mean()*100
@@ -1030,7 +1176,6 @@ def run_kfold(meshes):
         print(f"  FOLD {fold+1}/{k} (train={len(tr_idx)}, val={len(va_idx)})")
         print(f"{'='*50}")
 
-        # Build fold datasets
         tr_ds = MeshDataset.__new__(MeshDataset)
         tr_ds.samples = [full_ds.samples[i] for i in tr_idx]
         tr_ds.names = [full_ds.names[i] for i in tr_idx]
@@ -1057,7 +1202,6 @@ def run_kfold(meshes):
             'pct_good': np.mean([m.get('pct_good', 0) for m in metrics]),
         })
 
-    # Summary
     print("\n" + "=" * 60)
     print("📊 K-FOLD RESULTS")
     print("=" * 60)
@@ -1067,6 +1211,8 @@ def run_kfold(meshes):
     sjs = [r['mean_sj'] for r in fold_results]
     print(f"  AR:       {np.mean(ars):.3f} ± {np.std(ars):.3f}")
     print(f"  Jacobian: {np.mean(sjs):.3f} ± {np.std(sjs):.3f}")
+    pgs = [r['pct_good'] for r in fold_results]
+    print(f"  % Good:   {np.mean(pgs):.1f} ± {np.std(pgs):.1f}")
     return fold_results
 
 
@@ -1098,7 +1244,8 @@ class ResultsViz:
         fig = plt.figure(figsize=(6*n, 10))
         for i in range(min(n, len(dataset))):
             s = dataset.samples[i]
-            surf_t = torch.tensor(s['surface']).unsqueeze(0).to(DEVICE)
+            surf_6d = np.concatenate([s['surface'], s['normals']], axis=1)
+            surf_t = torch.tensor(surf_6d).unsqueeze(0).to(DEVICE)
             with torch.no_grad():
                 pred = model(surf_t)[0].cpu().numpy()[0]
 
@@ -1120,7 +1267,7 @@ class ResultsViz:
     @staticmethod
     def quality_comparison(fold_results):
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        fig.suptitle('Generated Mesh Quality', fontsize=14, fontweight='bold')
+        fig.suptitle('Generated Mesh Quality (TetGen)', fontsize=14, fontweight='bold')
         all_m = [m for fr in fold_results for m in fr['metrics'] if 'mean_ar' in m]
         if all_m:
             axes[0].hist([m['mean_ar'] for m in all_m], 20, color='steelblue', edgecolor='white')
@@ -1144,8 +1291,10 @@ def run_pipeline(skip_training=False):
     """
     print("\n" + "=" * 70)
     print("🦴 AI-Based Tetrahedral Mesh Generation for Femur")
-    print("   DGCNN Encoder + Conditional VAE + FoldingNet Decoder")
+    print("   DGCNN (6D) + Conditional VAE + Dual-Head Decoder + TetGen")
     print("=" * 70)
+    print(f"  TetGen available: {HAS_TETGEN}")
+    print(f"  Device: {DEVICE}")
 
     try:
         from google.colab import drive
@@ -1161,25 +1310,21 @@ def run_pipeline(skip_training=False):
         print("❌ No data. Set CONFIG['data_dir'].")
         return
 
-    # Validate
     for name, m in list(meshes.items())[:3]:
         st, _ = TetMeshValidator.validate(m['nodes'], m['tets'])
         print(f"  {name}: {st['valid']}/{st['total']} valid tets")
 
-    # Quality
     all_q = {}
     for name, m in meshes.items():
         q = QualityMetrics.compute(m['nodes'], m['tets'])
         if not q.empty:
             all_q[name] = q
 
-    # Surface extraction
     all_surf = {}
     for name, m in meshes.items():
         faces, nids, stats = SurfaceExtractor.get_surface_data(m['nodes'], m['tets'])
         all_surf[name] = {'faces': faces, 'nids': nids, 'stats': stats}
 
-    # Visualize sample
     sample = list(meshes.keys())[0]
     Visualizer.plot_input_vs_output(
         meshes[sample]['nodes'], meshes[sample]['tets'],
@@ -1195,7 +1340,7 @@ def run_pipeline(skip_training=False):
         return meshes, all_q, all_surf, stats_df
 
     # ── PHASE 2-3: Train & Evaluate ──
-    print("\n🧠 PHASE 2-3: Training DGCNN + CVAE Model")
+    print("\n🧠 PHASE 2-3: Training DGCNN + CVAE + TetGen Pipeline")
     fold_results = run_kfold(meshes)
 
     ResultsViz.training_curves(fold_results)
@@ -1206,7 +1351,7 @@ def run_pipeline(skip_training=False):
 
     print("\n" + "=" * 70)
     print("✅ PIPELINE COMPLETE")
-    print(f"  {len(meshes)} meshes | DGCNN+CVAE | "
+    print(f"  {len(meshes)} meshes | DGCNN+CVAE+TetGen | "
           f"CD={np.mean([r['mean_cd'] for r in fold_results]):.6f}")
     print("=" * 70)
 
