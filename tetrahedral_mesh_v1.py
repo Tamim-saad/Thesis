@@ -15,14 +15,15 @@ Ground Truth: 198 ANSYS CDB files (*_bonemat.cdb, patient-specific femurs)
 Architecture (research-validated):
   Encoder: DGCNN — dynamic graph CNN captures local surface geometry
   Generator: Conditional VAE — regularized for small dataset (198 samples)
-  Decoder: Dual-head FoldingNet — predicts interior positions + sizing field
+  Decoder: Triple-head FoldingNet — positions + sizing + material properties
   Mesher: TetGen — constrained Delaunay respecting surface boundary
 
 Key improvements over naive approach:
   1. TetGen constrained tetrahedralization (not scipy convex hull Delaunay)
   2. Surface normals in encoder input (6D: xyz + normals)
   3. Sizing field prediction (adaptive mesh density near cortical bone)
-  4. Material property parsing from CDB EBLOCK
+  4. Material property prediction (Young's modulus from MPDATA)
+  5. Per-element bone stiffness mapped from CT via Bonemat
 
 References:
   - Wang et al. "DGCNN" (2019) — dynamic k-NN graph features
@@ -98,6 +99,9 @@ ANSYS CDB file format (from lhpOpExporterAnsysCDB):
     Format: 19i8 or similar
     Data: mat_id, elem_type, real_const, section_id, esys, death,
           solid_model_ref, shape, num_nodes, unused, elem_id, then node_ids
+  - MPDATA section: material properties (from Bonemat)
+    Format: MPDATA,R5.0, 1,<prop>, <mat_id>, 1, <value>
+    Properties: EX (Young's modulus MPa), NUXY (Poisson 0.3), DENS (g/cm³)
   - Section ends with -1 on its own line
 """
 
@@ -122,13 +126,10 @@ class CDBFileReader:
         """Read a single CDB file → (nodes_array, elements_list, metadata)"""
         name = os.path.basename(filepath)
 
-        # Try official library first
-        if self._try_pyansys:
-            try:
-                return self._read_pyansys(filepath, name)
-            except Exception:
-                pass
-
+        # Always use direct parser — it handles MPDATA material properties
+        # which the pyansys library does NOT parse.
+        # The pyansys path is kept as a potential fallback for NBLOCK/EBLOCK
+        # format edge cases, but direct parser is preferred for completeness.
         return self._read_direct(filepath, name)
 
     def _read_pyansys(self, filepath, name):
@@ -154,7 +155,9 @@ class CDBFileReader:
     def _read_direct(self, filepath, name):
         """Direct text parsing following CDB format specification."""
         nodes, tets = [], []
-        section = None  # 'nblock' or 'eblock'
+        elem_mat_ids = []  # material ID per element
+        materials = {}     # mat_id → {EX, NUXY, DENS}
+        section = None     # 'nblock' or 'eblock'
         fmt_widths = None
 
         with open(filepath, 'r', errors='ignore') as f:
@@ -171,6 +174,11 @@ class CDBFileReader:
                     continue
                 elif stripped == '-1':
                     section = None
+                    continue
+
+                # MPDATA lines (not in a section block, appear after EBLOCK)
+                if stripped.startswith('MPDATA'):
+                    self._parse_mpdata(stripped, materials)
                     continue
 
                 # Format specification line (appears after NBLOCK/EBLOCK header)
@@ -191,12 +199,16 @@ class CDBFileReader:
                     if node is not None:
                         nodes.append(node)
                 elif section == 'eblock':
-                    tet = self._read_element(stripped)
-                    if tet is not None:
+                    result = self._read_element(stripped)
+                    if result is not None:
+                        tet, mat_id = result
                         tets.append(tet)
+                        elem_mat_ids.append(mat_id)
 
         nodes = np.array(nodes) if nodes else np.empty((0, 4))
         meta = self._extract_metadata(name, filepath)
+        meta['materials'] = materials
+        meta['elem_mat_ids'] = elem_mat_ids
         return nodes, tets, meta
 
     def _parse_fortran_format(self, fmt_str):
@@ -232,21 +244,40 @@ class CDBFileReader:
 
     def _read_element(self, line):
         """
-        Parse one EBLOCK data line → tuple of 4 node IDs (tetrahedron).
+        Parse one EBLOCK data line → (tuple of 4 node IDs, material_id).
         EBLOCK line: 11 metadata fields, then node IDs.
-        Field 9 (0-indexed: 8) = number of nodes per element.
+        Field 0 = material ID, Field 8 = number of nodes per element.
         """
         try:
             fields = line.split()
             if len(fields) >= 15:  # 11 meta + at least 4 nodes
+                mat_id = int(fields[0])  # Material ID (links to MPDATA)
                 n_nodes = int(fields[8])
                 node_ids = [int(fields[11 + i]) for i in range(min(n_nodes, len(fields) - 11))
                             if int(fields[11 + i]) > 0]
                 if len(node_ids) >= 4:
-                    return tuple(node_ids[:4])
+                    return tuple(node_ids[:4]), mat_id
         except (ValueError, IndexError):
             pass
         return None
+
+    @staticmethod
+    def _parse_mpdata(line, materials):
+        """
+        Parse MPDATA line → store in materials dict.
+        Format: MPDATA,R5.0, 1,EX, <mat_id>, 1, <value>,
+        """
+        try:
+            parts = [p.strip() for p in line.split(',')]
+            # parts: ['MPDATA', 'R5.0', '1', 'EX', 'mat_id', '1', 'value', '']
+            prop = parts[3].strip()   # 'EX', 'NUXY', or 'DENS'
+            mat_id = int(parts[4].strip())
+            value = float(parts[6].strip())
+            if mat_id not in materials:
+                materials[mat_id] = {}
+            materials[mat_id][prop] = value
+        except (ValueError, IndexError):
+            pass
 
     def _extract_metadata(self, filename, filepath):
         """Extract patient ID and side from filename convention."""
@@ -271,13 +302,15 @@ class CDBFileReader:
             name = os.path.basename(fp)
             nodes, tets, meta = self.read(fp)
             if len(nodes) > 0:
+                n_mats = len(meta.get('materials', {}))
                 self.meshes[name] = {'nodes': nodes, 'tets': tets, 'meta': meta}
-                print(f"  ✅ {name}: {len(nodes)} nodes, {len(tets)} tets")
+                print(f"  ✅ {name}: {len(nodes)} nodes, {len(tets)} tets, {n_mats} materials")
 
         n = len(self.meshes)
         total_n = sum(len(m['nodes']) for m in self.meshes.values())
         total_t = sum(len(m['tets']) for m in self.meshes.values())
-        print(f"\n📊 {n} files | {total_n:,} nodes | {total_t:,} tetrahedra")
+        total_m = sum(len(m['meta'].get('materials', {})) for m in self.meshes.values())
+        print(f"\n📊 {n} files | {total_n:,} nodes | {total_t:,} tetrahedra | {total_m:,} materials")
         return self.meshes
 
 
@@ -664,6 +697,7 @@ MODEL_CONFIG = {
     'kl_weight': 0.001,
     'sizing_weight': 0.05,
     'density_weight': 0.1,
+    'material_weight': 0.1,
     'k_folds': 5,
     'early_stop_patience': 40,
 }
@@ -679,6 +713,9 @@ class MeshRepresentation:
     CRITICAL FIX: Points and normals are sampled TOGETHER using
     the SAME indices — not independently, which would create
     mismatched (point, normal) pairs.
+
+    Material properties: computes per-node Young's modulus (log-scaled)
+    from Bonemat's per-element material assignments.
     """
 
     @staticmethod
@@ -746,9 +783,37 @@ class MeshRepresentation:
         return np.zeros(len(int_pts), dtype=np.float32)
 
     @staticmethod
-    def prepare_pair(nodes, tets):
+    def compute_node_stiffness(nid_to_pos, tets, elem_mat_ids, materials):
         """
-        Full preprocessing: mesh → (surface_with_normals, interior, sizing).
+        Compute per-node Young's modulus as weighted average from adjacent elements.
+        Returns dict: node_id → log10(EX_MPa). Log-scale because EX spans 340-18000.
+        """
+        node_ex_sum = {}   # node_id → sum of log(EX)
+        node_ex_count = {}  # node_id → count of adjacent elements
+
+        for i, tet in enumerate(tets):
+            if i >= len(elem_mat_ids):
+                break
+            mat_id = elem_mat_ids[i]
+            if mat_id not in materials or 'EX' not in materials[mat_id]:
+                continue
+            ex_val = materials[mat_id]['EX']
+            if ex_val <= 0:
+                continue
+            log_ex = np.log10(max(ex_val, 1.0))  # log10(EX) for numerical stability
+            for nid in tet[:4]:
+                node_ex_sum[nid] = node_ex_sum.get(nid, 0.0) + log_ex
+                node_ex_count[nid] = node_ex_count.get(nid, 0) + 1
+
+        node_stiffness = {}
+        for nid in node_ex_sum:
+            node_stiffness[nid] = node_ex_sum[nid] / node_ex_count[nid]
+        return node_stiffness
+
+    @staticmethod
+    def prepare_pair(nodes, tets, meta=None):
+        """
+        Full preprocessing: mesh → (surface_with_normals, interior, sizing, material).
 
         CRITICAL: surface points and normals are sampled with THE SAME
         indices so they remain paired correctly.
@@ -758,10 +823,34 @@ class MeshRepresentation:
         all_nids = set(nid_to_pos.keys())
         int_nids = all_nids - surf_nids
 
-        surf_pts = np.array([nid_to_pos[n] for n in surf_nids if n in nid_to_pos])
-        int_pts = np.array([nid_to_pos[n] for n in int_nids if n in nid_to_pos])
+        # Ordered lists so we can map back to node IDs
+        surf_nid_list = [n for n in surf_nids if n in nid_to_pos]
+        int_nid_list = [n for n in int_nids if n in nid_to_pos]
+
+        surf_pts = np.array([nid_to_pos[n] for n in surf_nid_list])
+        int_pts = np.array([nid_to_pos[n] for n in int_nid_list])
         if len(surf_pts) < 50 or len(int_pts) < 50:
             return None
+
+        # Compute per-node stiffness from material properties
+        materials = meta.get('materials', {}) if meta else {}
+        elem_mat_ids = meta.get('elem_mat_ids', []) if meta else []
+        node_stiffness = MeshRepresentation.compute_node_stiffness(
+            nid_to_pos, tets, elem_mat_ids, materials)
+
+        # Build interior stiffness array (ordered same as int_pts)
+        # Normalized: log10(EX) typically ranges from ~2.5 (340 MPa) to ~4.3 (18000 MPa)
+        # We normalize to [0, 1] within each mesh
+        int_stiffness_raw = np.array([node_stiffness.get(n, 0.0) for n in int_nid_list])
+        has_material = np.any(int_stiffness_raw > 0)
+        if has_material:
+            s_min = int_stiffness_raw[int_stiffness_raw > 0].min()
+            s_max = int_stiffness_raw.max()
+            s_range = max(s_max - s_min, 1e-6)
+            int_stiffness = np.where(int_stiffness_raw > 0,
+                                     (int_stiffness_raw - s_min) / s_range, 0.0)
+        else:
+            int_stiffness = np.zeros(len(int_pts))
 
         # Normalize all points together (same coordinate system)
         all_pts = np.vstack([surf_pts, int_pts])
@@ -784,12 +873,15 @@ class MeshRepresentation:
 
         int_sampled, i_idx = MeshRepresentation.sample_or_pad(int_norm, n_i)
         size_sampled = sizing[i_idx]   # SAME indices → paired correctly
+        mat_sampled = int_stiffness[i_idx]  # SAME indices → paired correctly
 
         return {
-            'surface': surf_sampled.astype(np.float32),   # (n_s, 3)
-            'normals': norm_sampled.astype(np.float32),    # (n_s, 3)
-            'interior': int_sampled.astype(np.float32),    # (n_i, 3)
-            'sizing': size_sampled.astype(np.float32),     # (n_i,)
+            'surface': surf_sampled.astype(np.float32),    # (n_s, 3)
+            'normals': norm_sampled.astype(np.float32),     # (n_s, 3)
+            'interior': int_sampled.astype(np.float32),     # (n_i, 3)
+            'sizing': size_sampled.astype(np.float32),      # (n_i,)
+            'material': mat_sampled.astype(np.float32),     # (n_i,) normalized log(EX)
+            'has_material': has_material,
             'centroid': centroid, 'scale': scale,
             'n_surf_orig': len(surf_pts), 'n_int_orig': len(int_pts),
         }
@@ -800,21 +892,27 @@ class MeshRepresentation:
 # ============================================================
 class MeshDataset(Dataset):
     """
-    Dataset returning (6D surface, interior, sizing) tuples.
+    Dataset returning (6D surface, interior, sizing, material) tuples.
 
     AUGMENTATION FIX: Full 3D rotation (random axis, not just Z),
     plus mirror, scale, jitter, and random point dropout.
+    Material data preserved through augmentation (scalar per point).
     """
 
     def __init__(self, meshes, augment=False):
         self.samples, self.names = [], []
         self.augment = augment
+        n_with_mat = 0
         for name, m in meshes.items():
-            pair = MeshRepresentation.prepare_pair(m['nodes'], m['tets'])
+            pair = MeshRepresentation.prepare_pair(
+                m['nodes'], m['tets'], m.get('meta'))
             if pair:
                 self.samples.append(pair)
                 self.names.append(name)
-        print(f"  Dataset: {len(self.samples)} valid samples ({'augmented' if augment else 'eval'})")
+                if pair.get('has_material', False):
+                    n_with_mat += 1
+        print(f"  Dataset: {len(self.samples)} valid samples "
+              f"({n_with_mat} with materials, {'augmented' if augment else 'eval'})")
 
     def __len__(self):
         return len(self.samples)
@@ -825,9 +923,10 @@ class MeshDataset(Dataset):
         surf = torch.tensor(surf_6d, dtype=torch.float32)
         intr = torch.tensor(s['interior'], dtype=torch.float32)
         sizing = torch.tensor(s['sizing'], dtype=torch.float32)
+        material = torch.tensor(s['material'], dtype=torch.float32)
         if self.augment:
             surf, intr = self._augment(surf, intr)
-        return surf, intr, sizing, idx
+        return surf, intr, sizing, material, idx
 
     @staticmethod
     def _random_rotation_matrix():
@@ -939,16 +1038,18 @@ class DGCNN(nn.Module):
 
 
 # ============================================================
-# SECTION 13: DUAL-HEAD DECODER + CVAE
+# SECTION 13: TRIPLE-HEAD DECODER + CVAE
 # ============================================================
-class DualHeadDecoder(nn.Module):
+class TripleHeadDecoder(nn.Module):
     """
-    FoldingNet-style decoder with two output heads:
+    FoldingNet-style decoder with THREE output heads:
       Head 1 (position): 3D unit-ball template → fold1 → fold2 → xyz positions
       Head 2 (sizing):   From decoded position + latent → local element size [0,1]
+      Head 3 (material):  From decoded position + latent → local stiffness [0,1]
 
-    This is the novel thesis contribution — predicting both WHERE interior
-    nodes go AND how DENSE the mesh should be at each location.
+    Novel thesis contribution — predicting WHERE interior nodes go,
+    how DENSE the mesh should be, AND what MATERIAL PROPERTIES each
+    location has (Young's modulus from CT bone density via Bonemat).
     """
 
     def __init__(self, z_dim=512, cond_dim=1024, n_pts=4096):
@@ -973,6 +1074,11 @@ class DualHeadDecoder(nn.Module):
             nn.Linear(3 + z_dim + cond_dim, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
             nn.Linear(128, 1), nn.Sigmoid())
+        # Material head (from decoded position + conditioning → bone stiffness)
+        self.material = nn.Sequential(
+            nn.Linear(3 + z_dim + cond_dim, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, 1), nn.Sigmoid())
 
     def _init_template(self, n):
         """Initialize template as uniform random points inside unit ball."""
@@ -991,16 +1097,18 @@ class DualHeadDecoder(nn.Module):
 
         pos1 = self.fold1(torch.cat([t, z_e, c_e], dim=2))
         pos2 = self.fold2(torch.cat([pos1, z_e, c_e], dim=2))
-        sz = self.sizing(torch.cat([pos2.detach(), z_e, c_e], dim=2)).squeeze(-1)
-        return pos2, sz
+        feat_input = torch.cat([pos2.detach(), z_e, c_e], dim=2)
+        sz = self.sizing(feat_input).squeeze(-1)
+        mat = self.material(feat_input).squeeze(-1)
+        return pos2, sz, mat
 
 
 class SurfaceToVolumeCVAE(nn.Module):
     """
-    Full generative model: Surface (6D) → Interior positions + sizing.
+    Full generative model: Surface (6D) → Interior positions + sizing + material.
 
     Encoder: DGCNN → 1024-dim features → μ, log σ²
-    Decoder: Dual-head FoldingNet → (positions, sizing)
+    Decoder: Triple-head FoldingNet → (positions, sizing, material)
     """
 
     def __init__(self):
@@ -1010,8 +1118,8 @@ class SurfaceToVolumeCVAE(nn.Module):
         enc_out = 1024  # DGCNN max+avg pool
         self.fc_mu = nn.Linear(enc_out, MODEL_CONFIG['latent_dim'])
         self.fc_logvar = nn.Linear(enc_out, MODEL_CONFIG['latent_dim'])
-        self.decoder = DualHeadDecoder(MODEL_CONFIG['latent_dim'], enc_out,
-                                       MODEL_CONFIG['n_interior_pts'])
+        self.decoder = TripleHeadDecoder(MODEL_CONFIG['latent_dim'], enc_out,
+                                         MODEL_CONFIG['n_interior_pts'])
 
     def encode(self, surf):
         feat = self.encoder(surf.transpose(1, 2))
@@ -1025,8 +1133,8 @@ class SurfaceToVolumeCVAE(nn.Module):
     def forward(self, surf):
         feat, mu, logvar = self.encode(surf)
         z = self.reparameterize(mu, logvar)
-        pos, sizing = self.decoder(z, feat)
-        return pos, sizing, mu, logvar
+        pos, sizing, material = self.decoder(z, feat)
+        return pos, sizing, material, mu, logvar
 
     def generate(self, surf, n_samples=1):
         """Generate interior nodes from surface (inference mode)."""
@@ -1036,8 +1144,8 @@ class SurfaceToVolumeCVAE(nn.Module):
             results = []
             for _ in range(n_samples):
                 z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
-                pos, sz = self.decoder(z, feat)
-                results.append((pos, sz))
+                pos, sz, mat = self.decoder(z, feat)
+                results.append((pos, sz, mat))
         return results
 
 
@@ -1063,9 +1171,10 @@ def hausdorff_distance(pred, target):
 
 
 class MeshGenLoss(nn.Module):
-    """Combined loss: Chamfer + KL + density uniformity + sizing MSE."""
+    """Combined loss: Chamfer + KL + density + sizing MSE + material MSE."""
 
-    def forward(self, pred_pos, pred_sizing, target_pos, target_sizing, mu, logvar):
+    def forward(self, pred_pos, pred_sizing, pred_material,
+                target_pos, target_sizing, target_material, mu, logvar):
         cd = chamfer_distance(pred_pos, target_pos)
         kl = -0.5 * torch.mean(1 + logvar - mu ** 2 - logvar.exp())
 
@@ -1077,14 +1186,19 @@ class MeshGenLoss(nn.Module):
         # Sizing field regression
         sizing_loss = F.mse_loss(pred_sizing, target_sizing)
 
+        # Material property regression (Young's modulus)
+        material_loss = F.mse_loss(pred_material, target_material)
+
         total = (cd
                  + MODEL_CONFIG['kl_weight'] * kl
                  + MODEL_CONFIG['density_weight'] * density
-                 + MODEL_CONFIG['sizing_weight'] * sizing_loss)
+                 + MODEL_CONFIG['sizing_weight'] * sizing_loss
+                 + MODEL_CONFIG['material_weight'] * material_loss)
 
         return total, {
             'cd': cd.item(), 'kl': kl.item(),
             'density': density.item(), 'sizing': sizing_loss.item(),
+            'material': material_loss.item(),
             'total': total.item()
         }
 
@@ -1112,12 +1226,15 @@ class Trainer:
     def _run_epoch(self, dl, train=True):
         self.model.train(train)
         total_l, total_cd, n = 0.0, 0.0, 0
-        for surf, intr, sizing, _ in dl:
+        for surf, intr, sizing, material, _ in dl:
             surf = surf.to(DEVICE)
             intr = intr.to(DEVICE)
             sizing = sizing.to(DEVICE)
-            pred_pos, pred_sz, mu, lv = self.model(surf)
-            loss, metrics = self.loss_fn(pred_pos, pred_sz, intr, sizing, mu, lv)
+            material = material.to(DEVICE)
+            pred_pos, pred_sz, pred_mat, mu, lv = self.model(surf)
+            loss, metrics = self.loss_fn(
+                pred_pos, pred_sz, pred_mat,
+                intr, sizing, material, mu, lv)
             if train:
                 self.opt.zero_grad()
                 loss.backward()
@@ -1242,6 +1359,7 @@ def evaluate_model(model, dataset):
       1. Predict interior nodes from surface
       2. Tetrahedralize with TetGen
       3. Compute FEA quality metrics + geometric distances
+      4. Evaluate material property prediction accuracy
     """
     model.eval()
     results = []
@@ -1251,9 +1369,10 @@ def evaluate_model(model, dataset):
         surf_6d = np.concatenate([s['surface'], s['normals']], axis=1)
         surf_t = torch.tensor(surf_6d, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
-        pred_pos, pred_sz, mu, lv = model(surf_t)
+        pred_pos, pred_sz, pred_mat, mu, lv = model(surf_t)
         pred = pred_pos.cpu().numpy()[0]
         pred_sizing = pred_sz.cpu().numpy()[0]
+        pred_material = pred_mat.cpu().numpy()[0]
 
         # Point cloud distances
         p_t = torch.tensor(pred).unsqueeze(0).float()
@@ -1262,6 +1381,14 @@ def evaluate_model(model, dataset):
         hd = hausdorff_distance(p_t, g_t).item()
 
         m = {'chamfer': cd, 'hausdorff': hd, 'file': dataset.names[i]}
+
+        # Material prediction accuracy
+        if s.get('has_material', False):
+            target_mat = s['material']
+            mat_mse = np.mean((pred_material - target_mat) ** 2)
+            mat_mae = np.mean(np.abs(pred_material - target_mat))
+            m['material_mse'] = float(mat_mse)
+            m['material_mae'] = float(mat_mae)
 
         # Denormalize and generate tet mesh
         pred_real = pred * s['scale'] + s['centroid']
@@ -1346,6 +1473,8 @@ def run_kfold(meshes):
             'mean_ar': np.mean([m.get('mean_ar', 0) for m in metrics]),
             'mean_sj': np.mean([m.get('mean_sj', 0) for m in metrics]),
             'pct_good': np.mean([m.get('pct_good', 0) for m in metrics]),
+            'mean_mat_mse': np.mean([m.get('material_mse', 0) for m in metrics]),
+            'mean_mat_mae': np.mean([m.get('material_mae', 0) for m in metrics]),
         })
 
     # Print summary
@@ -1357,11 +1486,15 @@ def run_kfold(meshes):
     ars = [r['mean_ar'] for r in fold_results]
     sjs = [r['mean_sj'] for r in fold_results]
     pgs = [r['pct_good'] for r in fold_results]
+    mms = [r['mean_mat_mse'] for r in fold_results]
+    mma = [r['mean_mat_mae'] for r in fold_results]
     print(f"  Chamfer:    {np.mean(cds):.6f} ± {np.std(cds):.6f}")
     print(f"  Hausdorff:  {np.mean(hds):.6f} ± {np.std(hds):.6f}")
     print(f"  Aspect R:   {np.mean(ars):.3f} ± {np.std(ars):.3f}")
     print(f"  Jacobian:   {np.mean(sjs):.3f} ± {np.std(sjs):.3f}")
     print(f"  % Good:     {np.mean(pgs):.1f}% ± {np.std(pgs):.1f}%")
+    print(f"  Mat MSE:    {np.mean(mms):.6f} ± {np.std(mms):.6f}")
+    print(f"  Mat MAE:    {np.mean(mma):.6f} ± {np.std(mma):.6f}")
     return fold_results
 
 
@@ -1451,7 +1584,8 @@ def run_pipeline(skip_training=False):
     """
     print("\n" + "=" * 70)
     print("🦴 AI-Based Tetrahedral Mesh Generation for Femur")
-    print("   DGCNN (6D) + CVAE + Dual-Head Decoder + TetGen")
+    print("   DGCNN (6D) + CVAE + Triple-Head Decoder + TetGen")
+    print("   Predicts: positions + sizing + material properties")
     print("=" * 70)
     print(f"  Device: {DEVICE}")
     print(f"  TetGen available: {HAS_TETGEN}")
@@ -1525,9 +1659,10 @@ def run_pipeline(skip_training=False):
     print("\n" + "=" * 70)
     print("✅ PIPELINE COMPLETE")
     if fold_results:
-        print(f"  {len(meshes)} meshes | DGCNN+CVAE+TetGen")
+        print(f"  {len(meshes)} meshes | DGCNN+CVAE+TripleHead+TetGen")
         print(f"  CD = {np.mean([r['mean_cd'] for r in fold_results]):.6f}")
         print(f"  HD = {np.mean([r['mean_hd'] for r in fold_results]):.6f}")
+        print(f"  Material MAE = {np.mean([r['mean_mat_mae'] for r in fold_results]):.6f}")
     print("=" * 70)
 
     return meshes, all_q, all_surf, stats_df, fold_results
