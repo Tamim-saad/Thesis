@@ -45,6 +45,10 @@ IN_CLOUD = IN_COLAB or IN_KAGGLE
 
 if IN_COLAB:
     print('☁️ Google Colab detected — installing dependencies...')
+    # System deps FIRST: xvfb for headless rendering, cmake for tetgen build
+    subprocess.call(['apt-get', 'update', '-qq'])
+    subprocess.call(['apt-get', 'install', '-y', '-qq',
+                     'xvfb', 'libgl1-mesa-glx', 'cmake'])
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q',
                            'ansys-mapdl-reader', 'pyvista', 'vtk', 'plotly',
                            'tetgen', 'seaborn', 'scikit-learn'])
@@ -61,9 +65,13 @@ if IN_COLAB:
 
 elif IN_KAGGLE:
     print('☁️ Kaggle detected — installing dependencies...')
+    # System deps FIRST: xvfb for headless rendering, cmake for tetgen build
+    subprocess.call(['apt-get', 'update', '-qq'])
+    subprocess.call(['apt-get', 'install', '-y', '-qq',
+                     'xvfb', 'libgl1-mesa-glx', 'cmake'])
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q',
                            'ansys-mapdl-reader', 'pyvista', 'vtk',
-                           'tetgen'])
+                           'tetgen', 'plotly', 'seaborn', 'scikit-learn'])
     os.environ['PYVISTA_OFF_SCREEN'] = 'true'
     os.environ['PYVISTA_USE_PANEL'] = 'false'
 
@@ -76,8 +84,20 @@ else:
 import numpy as np
 import pandas as pd
 import matplotlib
-# Use non-interactive backend in cloud environments (prevents display errors)
-if IN_CLOUD:
+# Use non-interactive backend in cloud environments WITHOUT a notebook kernel.
+# In Jupyter/IPython notebooks (Colab, Kaggle), the inline backend handles display;
+# forcing 'Agg' would silently suppress all plot output.
+def _in_notebook():
+    try:
+        from IPython import get_ipython
+        shell = get_ipython()
+        if shell is None:
+            return False
+        return 'IPKernelApp' in shell.config or 'google.colab' in str(type(shell))
+    except Exception:
+        return False
+
+if IN_CLOUD and not _in_notebook():
     matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -106,10 +126,13 @@ except ImportError:
 try:
     import pyvista as pv
     if IN_CLOUD:
-        pv.start_xvfb()  # Virtual framebuffer for headless rendering
+        try:
+            pv.start_xvfb()  # Virtual framebuffer for headless rendering
+        except Exception:
+            pass  # xvfb may not be available; pyvista still works for meshing
     pv.set_plot_theme('document')
     HAS_PYVISTA = True
-except (ImportError, OSError):
+except Exception:
     HAS_PYVISTA = False
 
 print('=' * 60)
@@ -264,10 +287,10 @@ class CDBFileReader:
                         fmt_widths = self._parse_fortran_format(stripped)
                     continue
 
-                # Skip empty/comment lines
+                # Skip empty/comment lines — but do NOT exit section for
+                # stray blanks or inline comments within NBLOCK/EBLOCK blocks.
+                # Sections are only terminated by the '-1' sentinel line (above).
                 if not stripped or stripped.startswith('!') or stripped.startswith('/'):
-                    if section:
-                        section = None
                     continue
 
                 # Parse data lines
@@ -438,7 +461,7 @@ class TetMeshValidator:
         coords = nodes[:, 1:4]
         return {
             'centroid': coords.mean(axis=0),
-            'span_mm': coords.ptp(axis=0),
+            'span_mm': coords.max(axis=0) - coords.min(axis=0),
             'min': coords.min(axis=0),
             'max': coords.max(axis=0),
         }
@@ -1495,7 +1518,7 @@ class Trainer:
     @staticmethod
     def load_model(path):
         """Load a saved model."""
-        ckpt = torch.load(path, map_location=DEVICE)
+        ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
         model = SurfaceToVolumeCVAE()
         model.load_state_dict(ckpt['model_state'])
         model = model.to(DEVICE)
@@ -1673,17 +1696,19 @@ def write_cdb(filepath, nodes, tets, material_values=None, poisson=0.3):
             elem_matid = np.ones(n_elems, dtype=int)
 
         # ── EBLOCK (elements) ──
-        # ANSYS SOLID185 tet format: mat, type, real, sec, esys, death,
-        #                            then 4 node IDs (1-indexed)
+        # ANSYS EBLOCK for 4-node tetrahedra (SOLID185)
+        # 11 metadata fields + 4 node IDs per element line:
+        #   mat, type, real_const, section_id, esys, death,
+        #   solidmodel_ref, shape_flag, num_nodes, unused, elem_id,
+        #   n1, n2, n3, n4
         f.write(f"EBLOCK,19,SOLID,{n_elems:>8},{n_elems:>8}\n")
         f.write("(19i9)\n")
         for i, tet in enumerate(tets):
             mat = int(elem_matid[i])
-            # Fields: mat, type(1), real(1), sec(1), esys(0), death(0),
-            #         8 zeros (mid-side nodes), then 4 corner nodes
+            eid = i + 1  # 1-indexed element ID
             n1, n2, n3, n4 = tet[0] + 1, tet[1] + 1, tet[2] + 1, tet[3] + 1
             f.write(f"{mat:9d}{1:9d}{1:9d}{1:9d}{0:9d}{0:9d}"
-                    f"{0:9d}{0:9d}{0:9d}{0:9d}"
+                    f"{0:9d}{0:9d}{4:9d}{0:9d}{eid:9d}"
                     f"{n1:9d}{n2:9d}{n3:9d}{n4:9d}\n")
         f.write("-1\n")  # EBLOCK terminator
 
