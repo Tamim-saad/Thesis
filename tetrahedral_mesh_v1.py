@@ -789,8 +789,8 @@ MODEL_CONFIG = {
     'latent_dim': 512,
     'dgcnn_k': 20,
     'input_dim': 6,       # xyz(3) + normals(3)
-    'batch_size': 4,
-    'epochs': 300,
+    'batch_size': 2,          # test run batch size
+    'epochs': 1,              # quick run
     'lr': 1e-4,
     'lr_patience': 25,
     'weight_decay': 1e-4,
@@ -798,7 +798,7 @@ MODEL_CONFIG = {
     'sizing_weight': 0.05,
     'density_weight': 0.1,
     'material_weight': 0.1,
-    'k_folds': 5,
+    'k_folds': 2,
     'early_stop_patience': 40,
 }
 
@@ -1951,6 +1951,7 @@ def run_pipeline(skip_training=False):
     print("\n📂 PHASE 1: Parsing CDB files")
     reader = CDBFileReader()
     meshes = reader.read_directory(CONFIG['data_dir'])
+    meshes = {k: meshes[k] for k in list(meshes)[:4]}
     if not meshes:
         print("❌ No data found. Set CONFIG['data_dir'].")
         return
