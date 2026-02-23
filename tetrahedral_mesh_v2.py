@@ -1,19 +1,17 @@
 """
 Tetrahedral Mesh v2: AI-Based FEA Mesh Generation for Hard Tissue (Femur)
 =========================================================================
-FIXED VERSION — All 7 CDB format bugs resolved, resolution increased.
+CDB format verified against real lhpOpExporterAnsysCDB dataset (174 files).
 
-Fixes over v1:
-  Bug 1: NBLOCK format (3i8,6e20.13) matches original CDB files
-  Bug 2: MPDATA placed AFTER EBLOCK (correct ANSYS order)
-  Bug 3: EBLOCK format (19i8) matches original CDB files
-  Bug 4: Material values denormalized back to physical MPa
-  Bug 5: Element type definitions (ET commands) added
-  Bug 6: Interior points passed to TetGen (not wasted)
-  Bug 7: n_interior_pts increased 1024 → 4096
+Format (matches originals exactly):
+  NBLOCK: (3i7,6e22.13) — 7-wide ints, 22-wide scientific floats
+  EBLOCK: (19i7) — 7-wide fields, 4-node tets (n_nodes=4)
+  MPDATA: MPTEMP before each MPDATA, 3 props (EX, NUXY, DENS)
+  ET: ET,3,73 (SOLID73 element type)
+  Footer: /GO then FINISH
 
 Architecture: DGCNN + CVAE + Triple-Head FoldingNet + TetGen
-Dataset: 198 CDB files from Living Human Project (LHP) pipeline
+Dataset: 174 CDB files from Living Human Project (LHP) pipeline
 """
 
 # ============================================================
@@ -293,7 +291,23 @@ class CDBFileReader:
         return None
 
     def _read_element(self, line):
+        """Parse EBLOCK element line — handles both (19i7) and (19i8) formats."""
         try:
+            # Try fixed-width parsing first (handles 6-digit IDs without spaces)
+            # Detect field width: try 7 first (real dataset), then 8 (v1 outputs)
+            for fw in [7, 8]:
+                if len(line.rstrip()) >= fw * 15:  # Need at least 15 fields
+                    try:
+                        vals = [int(line[i*fw:(i+1)*fw]) for i in range(min(19, len(line.rstrip()) // fw))]
+                        if len(vals) >= 15:
+                            mat_id = vals[0]
+                            n_nodes = vals[8]
+                            node_ids = [v for v in vals[11:11+min(n_nodes, 4)] if v > 0]
+                            if len(node_ids) >= 4:
+                                return tuple(node_ids[:4]), mat_id
+                    except (ValueError, IndexError):
+                        continue
+            # Fallback: whitespace split (works when fields have natural spacing)
             fields = line.split()
             if len(fields) >= 15:
                 mat_id = int(fields[0])
@@ -1160,9 +1174,8 @@ class Trainer:
 # ============================================================
 def _tetgen_from_points(surf_pts, interior_pts=None):
     """
-    FIX Bug6: TetGen now receives BOTH surface AND interior points.
-    Interior points from AI prediction are added as Steiner points
-    inside the convex hull, giving TetGen more control over interior density.
+    TetGen integration — constructs ConvexHull surface, then tetrahedralizes
+    with AI-predicted interior points included for better density control.
     """
     if HAS_TETGEN:
         try:
@@ -1176,50 +1189,46 @@ def _tetgen_from_points(surf_pts, interior_pts=None):
             ]).ravel()
             surf_mesh = pv.PolyData(surf_pts, faces_pv)
 
-            # If we have interior points, add them to the surface mesh
-            if interior_pts is not None and len(interior_pts) > 0:
-                all_pts_for_tet = np.vstack([surf_pts, interior_pts])
-                # Rebuild hull with all points — TetGen handles interior naturally
-                hull2 = ConvexHull(surf_pts)  # Keep hull from surface only
-                faces_pv2 = np.column_stack([
-                    np.full(len(hull2.simplices), 3),
-                    hull2.simplices
-                ]).ravel()
-                surf_mesh2 = pv.PolyData(surf_pts, faces_pv2)
-                tg = _tetgen_lib.TetGen(surf_mesh2)
-            else:
-                tg = _tetgen_lib.TetGen(surf_mesh)
+            tg = _tetgen_lib.TetGen(surf_mesh)
 
-            tg.tetrahedralize(order=1, mindihedral=10, minratio=1.5,
-                              nobisect=True)
+            # Try to pass interior points via addpoints (if supported)
+            tetrahedralized = False
+            if interior_pts is not None and len(interior_pts) > 0:
+                try:
+                    tg.tetrahedralize(
+                        order=1, mindihedral=10, minratio=1.5,
+                        nobisect=True,
+                        insertaddpoints=True,
+                        addpoints=interior_pts.astype(np.float64)
+                    )
+                    tetrahedralized = True
+                except TypeError:
+                    # addpoints not supported in this tetgen version
+                    pass
+
+            if not tetrahedralized:
+                tg.tetrahedralize(
+                    order=1, mindihedral=10, minratio=1.5,
+                    nobisect=True
+                )
 
             grid = tg.grid
             pts = np.array(grid.points)
             # Robust cell extraction — handle mixed cell types
-            cell_types = grid.celltypes
-            tet_mask = (cell_types == 10)  # VTK_TETRA = 10
-            if tet_mask.any():
-                offset = 0
-                elems = []
-                raw_cells = grid.cells
-                i = 0
-                while i < len(raw_cells):
-                    n_pts_cell = raw_cells[i]
-                    cell_nodes = raw_cells[i+1:i+1+n_pts_cell]
-                    if n_pts_cell == 4:
-                        elems.append(tuple(cell_nodes))
-                    i += n_pts_cell + 1
-            else:
-                # Fallback: assume all cells are tets
-                elems = []
-                raw_cells = grid.cells
-                i = 0
-                while i < len(raw_cells):
-                    n_pts_cell = raw_cells[i]
-                    cell_nodes = raw_cells[i+1:i+1+n_pts_cell]
-                    if n_pts_cell >= 4:
-                        elems.append(tuple(cell_nodes[:4]))
-                    i += n_pts_cell + 1
+            elems = []
+            raw_cells = grid.cells
+            i = 0
+            while i < len(raw_cells):
+                n_pts_cell = raw_cells[i]
+                cell_nodes = raw_cells[i+1:i+1+n_pts_cell]
+                if n_pts_cell == 4:  # Pure tet
+                    elems.append(tuple(cell_nodes))
+                elif n_pts_cell >= 4:  # Degenerate — take first 4
+                    elems.append(tuple(cell_nodes[:4]))
+                i += n_pts_cell + 1
+
+            if len(elems) == 0:
+                raise ValueError("TetGen produced 0 tetrahedra")
 
             nodes_arr = np.column_stack([np.arange(len(pts)), pts])
             return nodes_arr, elems
@@ -1681,6 +1690,6 @@ print('✅ Pipeline v2 function defined')
 print('  Call run_pipeline(skip_training=True) for data exploration')
 print('  Call run_pipeline(skip_training=False) for full training')
 
-# ── AUTO-RUN ──
-if __name__ == '__main__':
+# ── AUTO-RUN (works in Colab/Kaggle and as standalone script) ──
+if __name__ == '__main__' or IN_CLOUD:
     results = run_pipeline(skip_training=False)
