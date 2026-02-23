@@ -180,7 +180,7 @@ MODEL_CONFIG = {
     'epochs': 300,
     'lr': 3e-4,                # was 5e-4 — slightly lower for stability
     'lr_patience': 15,
-    'weight_decay': 5e-3,
+    'weight_decay': 1e-4,      # was 5e-3 — too aggressive for CVAE, kills KL learning
     'kl_weight': 0.001,
     'sizing_weight': 0.01,
     'density_weight': 0.05,
@@ -232,12 +232,15 @@ class CDBFileReader:
                 elif stripped.upper().startswith('EBLOCK'):
                     section = 'eblock'
                     continue
-                elif stripped == '-1':
+                elif stripped == '-1' or stripped.upper().startswith('N,R5'):
+                    # Both '-1' (EBLOCK terminator) and 'N,R5.3,LOC,  -1,' (NBLOCK terminator)
                     section = None
                     continue
                 if stripped.startswith('MPDATA'):
                     self._parse_mpdata(stripped, materials)
                     continue
+                if stripped.startswith('MPTEMP'):
+                    continue  # Skip temperature lines (precede MPDATA in real files)
                 if section and stripped.startswith('('):
                     if section == 'nblock':
                         fmt_widths = self._parse_fortran_format(stripped)
@@ -332,13 +335,17 @@ class CDBFileReader:
             print(f"❌ No CDB files in {directory}")
             return {}
         print(f"📂 Found {len(files)} CDB files")
-        for fp in files:
+        for fi, fp in enumerate(files):
             name = os.path.basename(fp)
-            nodes, tets, meta = self.read(fp)
-            if len(nodes) > 0:
-                self.meshes[name] = {'nodes': nodes, 'tets': tets, 'meta': meta}
-                n_mats = len(meta.get('materials', {}))
-                print(f"  ✅ {name}: {len(nodes)} nodes, {len(tets)} tets, {n_mats} materials")
+            try:
+                nodes, tets, meta = self.read(fp)
+                if len(nodes) > 0:
+                    self.meshes[name] = {'nodes': nodes, 'tets': tets, 'meta': meta}
+                    n_mats = len(meta.get('materials', {}))
+                    if (fi + 1) % 20 == 0 or fi == 0 or fi == len(files) - 1:
+                        print(f"  [{fi+1}/{len(files)}] ✅ {name}: {len(nodes)} nodes, {len(tets)} tets, {n_mats} materials")
+            except Exception as e:
+                print(f"  [{fi+1}/{len(files)}] ❌ {name}: {e}")
         n = len(self.meshes)
         total_n = sum(len(m['nodes']) for m in self.meshes.values())
         total_t = sum(len(m['tets']) for m in self.meshes.values())
@@ -666,7 +673,7 @@ class MeshRepresentation:
             nid_to_pos, tets, elem_mat_ids, materials)
 
         int_stiffness_raw = np.array([node_stiffness.get(n, 0.0) for n in int_nid_list])
-        has_material = np.any(int_stiffness_raw > 0)
+        has_material = bool(np.any(int_stiffness_raw > 0))  # Python bool, not numpy bool
         int_stiffness = int_stiffness_raw.copy()
 
         all_pts = np.vstack([surf_pts, int_pts])
@@ -978,7 +985,8 @@ def chamfer_distance(pred, target, chunk_size=256):
         d_t2p[:, i:end] = diff.pow(2).sum(-1).min(2)[0]
     return (d_p2t.mean(1) + d_t2p.mean(1)).mean()
 
-def hausdorff_distance(pred, target, chunk_size=512):
+def hausdorff_distance(pred, target, chunk_size=256):
+    """Chunked Hausdorff — same chunk_size as chamfer."""
     B, N, _ = pred.size()
     M = target.size(1)
     d_max_pred = torch.zeros(B, device=pred.device)
@@ -1071,6 +1079,10 @@ class Trainer:
                 pred_pos, pred_sz, pred_mat,
                 intr, sizing, material, mu, lv)
             if train:
+                # NaN guard — skip weight update if loss is invalid
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"    ⚠️ NaN/Inf loss detected, skipping batch")
+                    continue
                 self.opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -1238,8 +1250,8 @@ def evaluate_model(model, dataset):
         pred = pred_pos.cpu().numpy()[0]
         pred_material = pred_mat.cpu().numpy()[0]
 
-        p_t = torch.tensor(pred).unsqueeze(0).float()
-        g_t = torch.tensor(s['interior']).unsqueeze(0).float()
+        p_t = torch.tensor(pred).unsqueeze(0).float().to(DEVICE)
+        g_t = torch.tensor(s['interior']).unsqueeze(0).float().to(DEVICE)
         cd = chamfer_distance(p_t, g_t).item()
         hd = hausdorff_distance(p_t, g_t).item()
 
@@ -1273,70 +1285,62 @@ def evaluate_model(model, dataset):
 
 
 # ============================================================
-# SECTION 18: CDB EXPORT — ALL FORMAT BUGS FIXED
+# SECTION 18: CDB EXPORT — FORMAT MATCHES REAL ORIGINAL DATASET
 # ============================================================
 def write_cdb(filepath, nodes, tets, material_values=None, poisson=0.3):
-    """Write generated mesh to ANSYS CDB format — FORMAT MATCHES ORIGINAL FILES.
+    """Write generated mesh to ANSYS CDB format — matches lhpOpExporterAnsysCDB format.
 
-    FIX Bug1: NBLOCK format (3i8,6e20.13) — matches original CDB files
-    FIX Bug2: MPDATA placed AFTER EBLOCK — correct ANSYS order
-    FIX Bug3: EBLOCK format (19i8) — matches original CDB files
-    FIX Bug4: Material values denormalized back to physical MPa
-    FIX Bug5: Element type definitions (ET commands) added
+    FORMAT verified against real dataset files (e.g. AB029_left_bonemat.cdb):
+      - NBLOCK: (3i7,6e22.13) — 7-wide ints, 22-wide scientific floats
+      - EBLOCK: (19i7) — 7-wide fields, 4-node tets (n_nodes=4)
+      - MPTEMP before each MPDATA line
+      - 3 material properties: EX, NUXY, DENS
+      - File ends with /GO then FINISH
     """
     n_nodes = len(nodes)
     n_elems = len(tets)
 
     with open(filepath, 'w') as f:
-        # ── Header (FIX Bug5: proper ET definitions) ──
+        # ── Header (matches lhpOpExporterAnsysCDB format) ──
         now = datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y")
-        f.write(f"/BATCH\n")
-        f.write(f"/COM, Generated by AI Mesh Pipeline v2 {now}\n")
-        f.write(f"/PREP7\n")
-        f.write(f"ET,1,185\n")  # SOLID185 — 4-node tet
-        f.write(f"KEYOPT,1,1,0\n")
+        f.write(f"!! Generated by AI Mesh Pipeline v2 {now}\n")
+        f.write("\n")
+        f.write("/PREP7\n")
 
-        # ── NBLOCK (FIX Bug1: 3i8,6e20.13 format) ──
-        f.write(f"NBLOCK,6,SOLID,{n_nodes:>8},{n_nodes:>8}\n")
-        f.write("(3i8,6e20.13)\n")  # FIX: was (3i7,6e22.13)
+        # ── NBLOCK: (3i7,6e22.13) — matches originals exactly ──
+        f.write(f"NBLOCK,6,SOLID,{n_nodes:>8},{n_nodes:>9}\n")
+        f.write("(3i7,6e22.13)\n")
         for i, (x, y, z) in enumerate(nodes, start=1):
-            # FIX: 8-wide ints, 20-wide floats (was 7/22)
-            f.write(f"{i:8d}{0:8d}{0:8d}"
-                    f"{x:20.13E}{y:20.13E}{z:20.13E}\n")
-        f.write("-1\n")
+            f.write(f"{i:7d}{0:7d}{0:7d}"
+                    f"{x:22.13E}{y:22.13E}{z:22.13E}\n")
+        f.write("N,R5.3,LOC,       -1,\n")
 
-        # ── EBLOCK (FIX Bug3: 19i8 format) ──
-        # FIX Bug2: EBLOCK comes BEFORE MPDATA
-        f.write(f"EBLOCK,19,SOLID,{n_elems:>8},{n_elems:>8}\n")
-        f.write("(19i8)\n")  # FIX: was (19i9)
+        # ── ET: element type definition ──
+        f.write("\n")
+        f.write("ET,3,73\n")  # SOLID73 — matches originals
+        f.write("\n")
 
-        # Prepare material mapping
+        # ── Prepare material mapping ──
         if material_values is not None and MATERIAL_NORM['global_min'] is not None:
-            # FIX Bug4: Denormalize from [0,1] → log10(EX) → MPa
             gmin = MATERIAL_NORM['global_min']
             gmax = MATERIAL_NORM['global_max']
             grange = max(gmax - gmin, 1e-6)
 
             mats = np.asarray(material_values, dtype=np.float64).flatten()
-            # Denormalize: [0,1] → log10(EX)
-            log_ex = mats * grange + gmin
-            # Convert to linear MPa
-            pred_ex = 10 ** log_ex
+            log_ex = mats * grange + gmin  # [0,1] → log10(EX)
+            pred_ex = 10 ** log_ex          # log10(EX) → MPa
 
-            # For each tet, average the EX of its 4 corner nodes
+            # Average EX of 4 corner nodes per tet
             elem_ex = []
             for tet in tets:
                 tet_mats = [pred_ex[n] if n < len(pred_ex) else 10000.0 for n in tet]
                 elem_ex.append(np.mean(tet_mats))
 
-            ex_vals = np.array(elem_ex)
-            ex_vals = np.clip(ex_vals, 100.0, 30000.0)  # Physical bone range
+            ex_vals = np.clip(np.array(elem_ex), 100.0, 30000.0)
 
-            # Round to integer MPa for unique material IDs
+            # Bin into material groups (max ~350 to match dataset range)
             ex_rounded = np.round(ex_vals).astype(int)
             unique_ex = np.unique(ex_rounded)
-
-            # Bin into ~500 groups to avoid too many materials
             if len(unique_ex) > 500:
                 bins = np.linspace(ex_rounded.min(), ex_rounded.max(), 501)
                 ex_binned = np.digitize(ex_rounded, bins)
@@ -1348,32 +1352,49 @@ def write_cdb(filepath, nodes, tets, material_values=None, poisson=0.3):
             elem_matid = np.array([ex_to_matid[v] for v in ex_rounded])
         else:
             elem_matid = np.ones(n_elems, dtype=int)
+            ex_to_matid = None
 
+        # ── EBLOCK: (19i7) — 4-node tets, matches originals ──
+        # First field = max element ID, second = n_elems
+        max_eid = n_elems
+        f.write(f"EBLOCK,19,SOLID,{max_eid:>8},{n_elems:>9}\n")
+        f.write("(19i7)\n")
         for i, tet in enumerate(tets):
             mat = int(elem_matid[i])
             eid = i + 1
             n1, n2, n3, n4 = tet[0] + 1, tet[1] + 1, tet[2] + 1, tet[3] + 1
-            # ANSYS EBLOCK expects exactly 19 fields per line for (19i8)
-            # Fields: mat, etype, real, secnum, esys, death,
-            #         solidm, shape, n_nodes, 0, eid, n1..n8
-            # For 4-node tet: nodes 5-8 are 0
-            f.write(f"{mat:8d}{1:8d}{1:8d}{1:8d}{0:8d}{0:8d}"
-                    f"{0:8d}{0:8d}{4:8d}{0:8d}{eid:8d}"
-                    f"{n1:8d}{n2:8d}{n3:8d}{n4:8d}"
-                    f"{0:8d}{0:8d}{0:8d}{0:8d}\n")
+            # Real format: mat,etype,real,secnum,esys,death,solidm,shape,nnodes,0,eid, n1..n4
+            # n_nodes=4, etype=3 (matching ET,3,73)
+            f.write(f"{mat:7d}{3:7d}{1:7d}{1:7d}{0:7d}{0:7d}"
+                    f"{0:7d}{0:7d}{4:7d}{0:7d}{eid:7d}"
+                    f"{n1:7d}{n2:7d}{n3:7d}{n4:7d}\n")
         f.write("-1\n")
 
-        # ── MPDATA (FIX Bug2: AFTER EBLOCK, not before) ──
-        if material_values is not None and MATERIAL_NORM['global_min'] is not None:
+        # ── MPDATA: MPTEMP before each line, includes EX + NUXY + DENS ──
+        if ex_to_matid is not None:
             for ex_val, mat_id in sorted(ex_to_matid.items(), key=lambda x: x[1]):
-                f.write(f"MPDATA,R5.0, 1,EX  ,{mat_id:>6}, 1, "
-                        f"{float(ex_val):.8f}    ,\n")
-                f.write(f"MPDATA,R5.0, 1,NUXY,{mat_id:>6}, 1, "
-                        f"{poisson:.8f}    ,\n")
-        else:
-            f.write("MPDATA,R5.0, 1,EX  ,     1, 1, 10000.00000000    ,\n")
-            f.write(f"MPDATA,R5.0, 1,NUXY,     1, 1, {poisson:.8f}    ,\n")
+                ex_f = float(ex_val)
+                # Estimate density from EX using Morgan-Keller relation: ρ = (EX/6850)^(1/1.49)
+                # This gives bone-realistic density values (g/cm³)
+                dens = (ex_f / 6850.0) ** (1.0 / 1.49) if ex_f > 0 else 0.001
 
+                f.write(f"MPTEMP,R5.0, 1, 1,  0.00000000    ,\n")
+                f.write(f"MPDATA,R5.0, 1,EX,{mat_id:>6}, 1, {ex_f:.8f}    ,\n")
+                f.write(f"MPTEMP,R5.0, 1, 1,  0.00000000    ,\n")
+                f.write(f"MPDATA,R5.0, 1,NUXY,{mat_id:>6}, 1, {poisson:.8f}    ,\n")
+                f.write(f"MPTEMP,R5.0, 1, 1,  0.00000000    ,\n")
+                f.write(f"MPDATA,R5.0, 1,DENS,{mat_id:>6}, 1, {dens:.8f}    ,\n")
+        else:
+            f.write("MPTEMP,R5.0, 1, 1,  0.00000000    ,\n")
+            f.write("MPDATA,R5.0, 1,EX,     1, 1, 10000.00000000    ,\n")
+            f.write("MPTEMP,R5.0, 1, 1,  0.00000000    ,\n")
+            f.write(f"MPDATA,R5.0, 1,NUXY,     1, 1, {poisson:.8f}    ,\n")
+            f.write("MPTEMP,R5.0, 1, 1,  0.00000000    ,\n")
+            f.write("MPDATA,R5.0, 1,DENS,     1, 1, 1.00000000    ,\n")
+
+        # ── Footer ──
+        f.write("\n")
+        f.write("/GO\n")
         f.write("FINISH\n")
 
     print(f"  📁 CDB exported: {filepath} "
@@ -1385,11 +1406,14 @@ def write_cdb(filepath, nodes, tets, material_values=None, poisson=0.3):
 # SECTION 19: K-FOLD CROSS-VALIDATION (GroupKFold)
 # ============================================================
 def _extract_patient_id(name):
-    parts = name.split('_')
+    """Extract patient ID from filename like 'AB029_left_bonemat.cdb'."""
+    base = name.replace('_bonemat.cdb', '').replace('.cdb', '').replace('_re', '')
+    parts = base.split('_')
     for i, p in enumerate(parts):
         if p.lower() in ('left', 'right'):
             return '_'.join(parts[:i])
-    return name
+    # If no left/right found, use the first part (likely patient code)
+    return parts[0] if parts else name
 
 def run_kfold(meshes):
     print("\n" + "=" * 60)
