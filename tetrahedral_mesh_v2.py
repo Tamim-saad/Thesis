@@ -75,7 +75,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import seaborn as sns
-import glob, re, warnings, time, datetime
+import glob, re, warnings, time, datetime, gc
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -517,8 +517,10 @@ class Visualizer:
         ax2.set_title('Volume Mesh (AI Output)', fontsize=13, fontweight='bold')
         fig.suptitle(title, fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
-        plt.savefig('input_vs_output.png', dpi=CONFIG['fig_dpi'], bbox_inches='tight')
-        plt.show()
+        plt.savefig(os.path.join(OUTPUT_DIR, 'input_vs_output.png'), dpi=CONFIG['fig_dpi'], bbox_inches='tight')
+        if not IN_CLOUD:
+            plt.show()
+        plt.close(fig)
 
 
 class DatasetAnalyzer:
@@ -546,27 +548,24 @@ class DatasetAnalyzer:
 
     @staticmethod
     def plot_overview(df):
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         fig.suptitle('Dataset Overview — Femur CDB Files', fontsize=15, fontweight='bold')
         axes[0,0].hist(df['nodes'], bins=30, color='steelblue', edgecolor='white')
         axes[0,0].set_title('Nodes per File')
         axes[0,1].hist(df['tets'], bins=30, color='teal', edgecolor='white')
         axes[0,1].set_title('Tetrahedra per File')
-        if 'surface_nodes' in df:
-            axes[0,2].bar(['Surface','Interior'],
-                          [df['surface_nodes'].mean(), df['interior_nodes'].mean()],
-                          color=['coral','mediumpurple'])
-            axes[0,2].set_title('Avg Node Split')
         if 'side' in df:
             sc = df['side'].value_counts()
             axes[1,0].bar(sc.index, sc.values, color=['#3498db','#e74c3c'])
             axes[1,0].set_title('Left vs Right')
         if 'pct_good' in df:
-            axes[1,2].hist(df['pct_good'].dropna(), bins=20, color='#2ecc71', edgecolor='white')
-            axes[1,2].set_title('% Good Quality')
+            axes[1,1].hist(df['pct_good'].dropna(), bins=20, color='#2ecc71', edgecolor='white')
+            axes[1,1].set_title('% Good Quality')
         plt.tight_layout()
-        plt.savefig('dataset_overview.png', dpi=CONFIG['fig_dpi'], bbox_inches='tight')
-        plt.show()
+        plt.savefig(os.path.join(OUTPUT_DIR, 'dataset_overview.png'), dpi=CONFIG['fig_dpi'], bbox_inches='tight')
+        if not IN_CLOUD:
+            plt.show()
+        plt.close(fig)
 
 
 print('✅ CDBFileReader, Validator, QualityMetrics, SurfaceExtractor, Visualizer ready')
@@ -963,7 +962,8 @@ except Exception as e:
 # ============================================================
 # SECTION 14: LOSS FUNCTIONS
 # ============================================================
-def chamfer_distance(pred, target, chunk_size=512):
+def chamfer_distance(pred, target, chunk_size=256):
+    """Chunked Chamfer distance — chunk_size=256 to avoid OOM with 4096 pts."""
     B, N, _ = pred.size()
     M = target.size(1)
     d_p2t = torch.zeros(B, N, device=pred.device)
@@ -995,7 +995,8 @@ def hausdorff_distance(pred, target, chunk_size=512):
         d_max_tgt = torch.max(d_max_tgt, chunk_mins.max(1)[0])
     return torch.max(d_max_pred, d_max_tgt).mean()
 
-def density_uniformity(pred_pos, n_subsample=1024):
+def density_uniformity(pred_pos, n_subsample=512):
+    """Subsample to 512 to avoid OOM (512^2 = 262K vs 1024^2 = 1M entries)."""
     B, N, D = pred_pos.size()
     if N > n_subsample:
         idx = torch.randperm(N, device=pred_pos.device)[:n_subsample]
@@ -1003,9 +1004,21 @@ def density_uniformity(pred_pos, n_subsample=1024):
     else:
         pts = pred_pos
     n = pts.size(1)
-    d = (pts.unsqueeze(2) - pts.unsqueeze(1)).pow(2).sum(-1)
-    d = d + torch.eye(n, device=pts.device).unsqueeze(0) * 1e6
-    return d.min(2)[0].std(1).mean()
+    # Chunked pairwise distance to avoid GPU OOM
+    min_dists = torch.full((B, n), 1e6, device=pts.device)
+    chunk = 128
+    for i in range(0, n, chunk):
+        end_i = min(i + chunk, n)
+        for j in range(0, n, chunk):
+            end_j = min(j + chunk, n)
+            d = (pts[:, i:end_i].unsqueeze(2) - pts[:, j:end_j].unsqueeze(1)).pow(2).sum(-1)
+            # Mask diagonal (same-point distances)
+            if i == j:
+                mask = torch.eye(end_i - i, end_j - j, device=pts.device).unsqueeze(0).bool()
+                d.masked_fill_(mask, 1e6)
+            chunk_min = d.min(2)[0]  # (B, chunk_i)
+            min_dists[:, i:end_i] = torch.min(min_dists[:, i:end_i], chunk_min)
+    return min_dists.std(1).mean()
 
 class MeshGenLoss(nn.Module):
     def forward(self, pred_pos, pred_sizing, pred_material,
@@ -1151,20 +1164,51 @@ def _tetgen_from_points(surf_pts, interior_pts=None):
             ]).ravel()
             surf_mesh = pv.PolyData(surf_pts, faces_pv)
 
-            tg = _tetgen_lib.TetGen(surf_mesh)
-
-            # Add interior points as insertion points if available
+            # If we have interior points, add them to the surface mesh
             if interior_pts is not None and len(interior_pts) > 0:
-                tg.tetrahedralize(order=1, mindihedral=10, minratio=1.5,
-                                  nobisect=True)
+                all_pts_for_tet = np.vstack([surf_pts, interior_pts])
+                # Rebuild hull with all points — TetGen handles interior naturally
+                hull2 = ConvexHull(surf_pts)  # Keep hull from surface only
+                faces_pv2 = np.column_stack([
+                    np.full(len(hull2.simplices), 3),
+                    hull2.simplices
+                ]).ravel()
+                surf_mesh2 = pv.PolyData(surf_pts, faces_pv2)
+                tg = _tetgen_lib.TetGen(surf_mesh2)
             else:
-                tg.tetrahedralize(order=1, mindihedral=10, minratio=1.5,
-                                  nobisect=True)
+                tg = _tetgen_lib.TetGen(surf_mesh)
+
+            tg.tetrahedralize(order=1, mindihedral=10, minratio=1.5,
+                              nobisect=True)
 
             grid = tg.grid
             pts = np.array(grid.points)
-            cells = grid.cells.reshape(-1, 5)[:, 1:]
-            elems = [tuple(row) for row in cells]
+            # Robust cell extraction — handle mixed cell types
+            cell_types = grid.celltypes
+            tet_mask = (cell_types == 10)  # VTK_TETRA = 10
+            if tet_mask.any():
+                offset = 0
+                elems = []
+                raw_cells = grid.cells
+                i = 0
+                while i < len(raw_cells):
+                    n_pts_cell = raw_cells[i]
+                    cell_nodes = raw_cells[i+1:i+1+n_pts_cell]
+                    if n_pts_cell == 4:
+                        elems.append(tuple(cell_nodes))
+                    i += n_pts_cell + 1
+            else:
+                # Fallback: assume all cells are tets
+                elems = []
+                raw_cells = grid.cells
+                i = 0
+                while i < len(raw_cells):
+                    n_pts_cell = raw_cells[i]
+                    cell_nodes = raw_cells[i+1:i+1+n_pts_cell]
+                    if n_pts_cell >= 4:
+                        elems.append(tuple(cell_nodes[:4]))
+                    i += n_pts_cell + 1
+
             nodes_arr = np.column_stack([np.arange(len(pts)), pts])
             return nodes_arr, elems
         except Exception as e:
@@ -1309,10 +1353,14 @@ def write_cdb(filepath, nodes, tets, material_values=None, poisson=0.3):
             mat = int(elem_matid[i])
             eid = i + 1
             n1, n2, n3, n4 = tet[0] + 1, tet[1] + 1, tet[2] + 1, tet[3] + 1
-            # FIX Bug3: 8-wide integers (was 9-wide)
+            # ANSYS EBLOCK expects exactly 19 fields per line for (19i8)
+            # Fields: mat, etype, real, secnum, esys, death,
+            #         solidm, shape, n_nodes, 0, eid, n1..n8
+            # For 4-node tet: nodes 5-8 are 0
             f.write(f"{mat:8d}{1:8d}{1:8d}{1:8d}{0:8d}{0:8d}"
                     f"{0:8d}{0:8d}{4:8d}{0:8d}{eid:8d}"
-                    f"{n1:8d}{n2:8d}{n3:8d}{n4:8d}\n")
+                    f"{n1:8d}{n2:8d}{n3:8d}{n4:8d}"
+                    f"{0:8d}{0:8d}{0:8d}{0:8d}\n")
         f.write("-1\n")
 
         # ── MPDATA (FIX Bug2: AFTER EBLOCK, not before) ──
@@ -1387,8 +1435,10 @@ def run_kfold(meshes):
         va_ds.augment = False
 
         tr_dl = DataLoader(tr_ds, MODEL_CONFIG['batch_size'],
-                           shuffle=True, drop_last=len(tr_ds) > MODEL_CONFIG['batch_size'])
-        va_dl = DataLoader(va_ds, MODEL_CONFIG['batch_size'])
+                           shuffle=True, drop_last=len(tr_ds) > MODEL_CONFIG['batch_size'],
+                           num_workers=2 if IN_CLOUD else 0, pin_memory=torch.cuda.is_available())
+        va_dl = DataLoader(va_ds, MODEL_CONFIG['batch_size'],
+                           num_workers=2 if IN_CLOUD else 0, pin_memory=torch.cuda.is_available())
 
         model = SurfaceToVolumeCVAE()
         trainer = Trainer(model, tr_dl, va_dl, fold=fold + 1)
@@ -1410,6 +1460,13 @@ def run_kfold(meshes):
             'mean_mat_mse': np.mean([m.get('material_mse', 0) for m in metrics]),
             'mean_mat_mae': np.mean([m.get('material_mae', 0) for m in metrics]),
         })
+
+        # Free GPU memory between folds to prevent OOM on long runs
+        del model, trainer, tr_dl, va_dl
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"  🧹 GPU memory cleared after fold {fold + 1}")
 
     # Print summary
     print("\n" + "=" * 60)
@@ -1448,7 +1505,9 @@ class ResultsViz:
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, 'training_curves_v2.png'),
                     dpi=CONFIG['fig_dpi'], bbox_inches='tight')
-        plt.show()
+        if not IN_CLOUD:
+            plt.show()
+        plt.close(fig)
 
     @staticmethod
     def generated_vs_gt(model, dataset, n=3):
@@ -1473,7 +1532,9 @@ class ResultsViz:
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, 'gen_vs_gt_v2.png'),
                     dpi=CONFIG['fig_dpi'], bbox_inches='tight')
-        plt.show()
+        if not IN_CLOUD:
+            plt.show()
+        plt.close(fig)
 
 
 # ============================================================
@@ -1513,12 +1574,18 @@ def run_pipeline(skip_training=False):
         all_surf[name] = {'faces': faces, 'nids': nids, 'stats': stats}
 
     sample = list(meshes.keys())[0]
-    Visualizer.plot_input_vs_output(
-        meshes[sample]['nodes'], meshes[sample]['tets'],
-        all_surf[sample]['faces'], sample)
+    try:
+        Visualizer.plot_input_vs_output(
+            meshes[sample]['nodes'], meshes[sample]['tets'],
+            all_surf[sample]['faces'], sample)
+    except Exception as e:
+        print(f"  ⚠️ Visualization skipped: {e}")
 
     stats_df = DatasetAnalyzer.analyze(meshes)
-    DatasetAnalyzer.plot_overview(stats_df)
+    try:
+        DatasetAnalyzer.plot_overview(stats_df)
+    except Exception as e:
+        print(f"  ⚠️ Overview plot skipped: {e}")
 
     if skip_training:
         print("\n⏩ Phase 1 complete. Call run_pipeline() for full training.")
@@ -1543,7 +1610,7 @@ def run_pipeline(skip_training=False):
         best_model.eval()
         exported_count = 0
 
-        for i in range(min(5, len(full_ds))):
+        for i in range(len(full_ds)):
             try:
                 s = full_ds.samples[i]
                 name = full_ds.names[i]
