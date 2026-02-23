@@ -17,7 +17,7 @@ Dataset: 174 CDB files from Living Human Project (LHP) pipeline
 # ============================================================
 # SECTION 0: ENVIRONMENT SETUP
 # ============================================================
-import os, sys, subprocess
+import os, sys, subprocess, datetime, gc
 
 IN_COLAB = 'google.colab' in sys.modules or os.path.exists('/content')
 IN_KAGGLE = os.path.exists('/kaggle')
@@ -1027,19 +1027,24 @@ def density_uniformity(pred_pos, n_subsample=512):
         pts = pred_pos
     n = pts.size(1)
     # Chunked pairwise distance to avoid GPU OOM
-    min_dists = torch.full((B, n), 1e6, device=pts.device)
+    # FIX: Use list collection instead of inplace tensor assignment to avoid
+    # breaking autograd (the original min_dists[:, i:end_i] = ... was inplace)
     chunk = 128
+    chunk_results = []
     for i in range(0, n, chunk):
         end_i = min(i + chunk, n)
+        chunk_min_vals = torch.full((B, end_i - i), 1e6, device=pts.device)
         for j in range(0, n, chunk):
             end_j = min(j + chunk, n)
             d = (pts[:, i:end_i].unsqueeze(2) - pts[:, j:end_j].unsqueeze(1)).pow(2).sum(-1)
-            # Mask diagonal (same-point distances)
+            # FIX: Use torch.where instead of inplace masked_fill_
             if i == j:
                 mask = torch.eye(end_i - i, end_j - j, device=pts.device).unsqueeze(0).bool()
-                d.masked_fill_(mask, 1e6)
-            chunk_min = d.min(2)[0]  # (B, chunk_i)
-            min_dists[:, i:end_i] = torch.min(min_dists[:, i:end_i], chunk_min)
+                d = torch.where(mask, torch.tensor(1e6, device=pts.device), d)
+            cur_min = d.min(2)[0]  # (B, chunk_i)
+            chunk_min_vals = torch.min(chunk_min_vals, cur_min)
+        chunk_results.append(chunk_min_vals)
+    min_dists = torch.cat(chunk_results, dim=1)
     return min_dists.std(1).mean()
 
 class MeshGenLoss(nn.Module):
