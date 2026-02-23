@@ -24,19 +24,32 @@ IN_KAGGLE = os.path.exists('/kaggle')
 IN_CLOUD = IN_COLAB or IN_KAGGLE
 
 if IN_COLAB:
-    print('☁️ Google Colab detected — installing dependencies...')
-    subprocess.call(['apt-get', 'update', '-qq'])
-    subprocess.call(['apt-get', 'install', '-y', '-qq',
-                     'xvfb', 'libgl1-mesa-glx', 'cmake'])
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q',
-                           'ansys-mapdl-reader', 'pyvista', 'vtk', 'plotly',
-                           'tetgen', 'seaborn', 'scikit-learn'])
+    print('☁️ Google Colab detected')
+    # Only install if packages are missing — re-running pip install after
+    # torch is loaded corrupts torch.fx and causes AttributeError
+    def _need_install():
+        try:
+            import tetgen, pyvista, plotly, ansys.mapdl.reader
+            return False
+        except ImportError:
+            return True
+    if _need_install():
+        print('  📦 Installing dependencies (first run)...')
+        subprocess.call(['apt-get', 'update', '-qq'])
+        subprocess.call(['apt-get', 'install', '-y', '-qq',
+                         'xvfb', 'libgl1-mesa-glx', 'cmake'])
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q',
+                               'ansys-mapdl-reader', 'pyvista', 'vtk', 'plotly',
+                               'tetgen', 'seaborn', 'scikit-learn'])
+    else:
+        print('  ✅ Dependencies already installed')
     try:
         from google.colab import drive
-        drive.mount('/content/drive', force_remount=False)
+        drive.mount('/content/drive', force_remount=True)
         print('  ✅ Google Drive mounted')
     except Exception as e:
-        print(f'  ⚠️ Drive mount failed: {e}')
+        print(f'  ⚠️ Drive mount issue: {e}')
+        print('  ⚠️ If data is missing, run: from google.colab import drive; drive.mount("/content/drive", force_remount=True)')
     os.environ['PYVISTA_OFF_SCREEN'] = 'true'
     os.environ['PYVISTA_USE_PANEL'] = 'false'
 
@@ -56,7 +69,7 @@ else:
 
 # Output directory
 if IN_COLAB:
-    OUTPUT_DIR = '/content/drive/MyDrive/thesis/me/tetra/thesis_output/'
+    OUTPUT_DIR = '/content/drive/MyDrive/thesis/thesis_output/'
 elif IN_KAGGLE:
     OUTPUT_DIR = '/kaggle/working/thesis_output/'
 else:
@@ -68,6 +81,11 @@ print(f'📁 Output directory: {OUTPUT_DIR}')
 # ============================================================
 # SECTION 1: IMPORTS
 # ============================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -104,10 +122,7 @@ try:
 except Exception:
     HAS_PYVISTA = False
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+
 
 try:
     import tetgen as _tetgen_lib
@@ -132,6 +147,7 @@ print(f'  TetGen: {"✅" if HAS_TETGEN else "❌"}')
 # ============================================================
 def _auto_detect_data_dir():
     candidates = [
+        '/content/drive/MyDrive/thesis/4_bonemat_cdb_files',
         '/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files',
         '/kaggle/input/femur-cdb-files',
         '/kaggle/input/femur-cdb-files/4_bonemat_cdb_files',
@@ -147,7 +163,7 @@ def _auto_detect_data_dir():
                 return path
     print('  ⚠️ Data directory not found automatically.')
     if IN_COLAB:
-        return '/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files'
+        return '/content/drive/MyDrive/thesis/4_bonemat_cdb_files'
     elif IN_KAGGLE:
         return '/kaggle/input/femur-cdb-files'
     else:
