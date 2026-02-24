@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-02-18
 > **Author:** Tamim Saad
-> **Program:** B.Sc. in CSE, KUET (Khulna University of Engineering & Technology)
+> **Program:** B.Sc. in CSE, BUET (Bangladesh University of Engineering & Technology)
 > **Supervisor:** Prof. Mahmuda Naznin, BUET CSE
 > **Collaborator:** Prof. Tanvir R. Faisal, University of Louisiana at Lafayette (4MLab)
 

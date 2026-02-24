@@ -1195,73 +1195,48 @@ class Trainer:
 # ============================================================
 def _tetgen_from_points(surf_pts, interior_pts=None):
     """
-    TetGen integration — constructs ConvexHull surface, then tetrahedralizes
-    with AI-predicted interior points included for better density control.
+    Create tetrahedral mesh from surface + interior points.
+
+    FIX: Does NOT use ConvexHull (which destroyed concave femur geometry).
+    Uses Delaunay triangulation on all points combined, then applies
+    alpha-shape filtering to remove exterior tetrahedra with overly-long edges.
     """
-    if HAS_TETGEN:
-        try:
-            import pyvista as pv
-            from scipy.spatial import ConvexHull
-
-            hull = ConvexHull(surf_pts)
-            faces_pv = np.column_stack([
-                np.full(len(hull.simplices), 3),
-                hull.simplices
-            ]).ravel()
-            surf_mesh = pv.PolyData(surf_pts, faces_pv)
-
-            tg = _tetgen_lib.TetGen(surf_mesh)
-
-            # Try to pass interior points via addpoints (if supported)
-            tetrahedralized = False
-            if interior_pts is not None and len(interior_pts) > 0:
-                try:
-                    tg.tetrahedralize(
-                        order=1, mindihedral=10, minratio=1.5,
-                        nobisect=True,
-                        insertaddpoints=True,
-                        addpoints=interior_pts.astype(np.float64)
-                    )
-                    tetrahedralized = True
-                except TypeError:
-                    # addpoints not supported in this tetgen version
-                    pass
-
-            if not tetrahedralized:
-                tg.tetrahedralize(
-                    order=1, mindihedral=10, minratio=1.5,
-                    nobisect=True
-                )
-
-            grid = tg.grid
-            pts = np.array(grid.points)
-            # Robust cell extraction — handle mixed cell types
-            elems = []
-            raw_cells = grid.cells
-            i = 0
-            while i < len(raw_cells):
-                n_pts_cell = raw_cells[i]
-                cell_nodes = raw_cells[i+1:i+1+n_pts_cell]
-                if n_pts_cell == 4:  # Pure tet
-                    elems.append(tuple(cell_nodes))
-                elif n_pts_cell >= 4:  # Degenerate — take first 4
-                    elems.append(tuple(cell_nodes[:4]))
-                i += n_pts_cell + 1
-
-            if len(elems) == 0:
-                raise ValueError("TetGen produced 0 tetrahedra")
-
-            nodes_arr = np.column_stack([np.arange(len(pts)), pts])
-            return nodes_arr, elems
-        except Exception as e:
-            print(f"    TetGen failed ({e}), falling back to scipy")
-
     from scipy.spatial import Delaunay
+
     all_pts = surf_pts if interior_pts is None else np.vstack([surf_pts, interior_pts])
+
+    # Delaunay tetrahedralization of all points
     tri = Delaunay(all_pts)
-    elems = [tuple(simp) for simp in tri.simplices]
+    simplices = tri.simplices
+
+    # Alpha-shape filtering: remove tets with edges that are too long
+    edge_pairs = [(0,1), (0,2), (0,3), (1,2), (1,3), (2,3)]
+    all_edge_lengths = []
+    tet_max_edges = np.zeros(len(simplices))
+
+    for i, simp in enumerate(simplices):
+        pts = all_pts[simp]
+        max_edge = 0.0
+        for a, b in edge_pairs:
+            edge_len = np.linalg.norm(pts[a] - pts[b])
+            all_edge_lengths.append(edge_len)
+            max_edge = max(max_edge, edge_len)
+        tet_max_edges[i] = max_edge
+
+    # Adaptive threshold: keep tets whose longest edge <= 4x median
+    median_edge = np.median(all_edge_lengths)
+    alpha_threshold = median_edge * 4.0
+
+    valid_tets = []
+    for i, simp in enumerate(simplices):
+        if tet_max_edges[i] <= alpha_threshold:
+            valid_tets.append(tuple(simp))
+
+    if len(valid_tets) == 0:
+        valid_tets = [tuple(simp) for simp in simplices]
+
     nodes_arr = np.column_stack([np.arange(len(all_pts)), all_pts])
-    return nodes_arr, elems
+    return nodes_arr, valid_tets
 
 
 # ============================================================
@@ -1351,24 +1326,20 @@ def write_cdb(filepath, nodes, tets, material_values=None, poisson=0.3):
         f.write("\n")
 
         # ── Prepare material mapping ──
-        if material_values is not None and MATERIAL_NORM['global_min'] is not None:
-            gmin = MATERIAL_NORM['global_min']
-            gmax = MATERIAL_NORM['global_max']
-            grange = max(gmax - gmin, 1e-6)
-
-            mats = np.asarray(material_values, dtype=np.float64).flatten()
-            log_ex = mats * grange + gmin  # [0,1] → log10(EX)
-            pred_ex = 10 ** log_ex          # log10(EX) → MPa
+        if material_values is not None:
+            # material_values is now per-node EX in MPa (from KDTree mapping)
+            node_ex = np.asarray(material_values, dtype=np.float64).flatten()
+            node_ex = np.clip(node_ex, 100.0, 30000.0)
 
             # Average EX of 4 corner nodes per tet
             elem_ex = []
             for tet in tets:
-                tet_mats = [pred_ex[n] if n < len(pred_ex) else 10000.0 for n in tet]
-                elem_ex.append(np.mean(tet_mats))
+                corner_ex = [node_ex[n] if n < len(node_ex) else 5000.0 for n in tet]
+                elem_ex.append(np.mean(corner_ex))
 
             ex_vals = np.clip(np.array(elem_ex), 100.0, 30000.0)
 
-            # Bin into material groups (max ~350 to match dataset range)
+            # Bin into material groups (max ~500 to match dataset range)
             ex_rounded = np.round(ex_vals).astype(int)
             unique_ex = np.unique(ex_rounded)
             if len(unique_ex) > 500:
@@ -1680,14 +1651,28 @@ def run_pipeline(skip_training=False):
                 pred_real = pred_pos.cpu().numpy()[0] * s['scale'] + s['centroid']
                 pred_material = pred_mat.cpu().numpy()[0]
 
-                # FIX Bug6: pass interior points to TetGen
+                # FIX Bug6: Delaunay tetrahedralization (no ConvexHull)
                 nodes_arr, elems = _tetgen_from_points(surf_real, pred_real)
 
-                # Export with FIXED CDB format
+                # FIX Bug7: KDTree material mapping (not index lookup)
+                # pred_material has 4096 values for AI interior points, but
+                # mesh has ~6000+ nodes in different order. Use spatial proximity.
+                from scipy.spatial import KDTree as _KDTree
+                gmin = MATERIAL_NORM.get('global_min', 0.1)
+                gmax = MATERIAL_NORM.get('global_max', 4.3)
+                grange = max(gmax - gmin, 1e-6)
+                log_ex = pred_material * grange + gmin
+                pred_ex_mpa = 10.0 ** log_ex
+
+                tree = _KDTree(pred_real)
+                _, nn_idx = tree.query(nodes_arr[:, 1:4])
+                node_ex = np.clip(pred_ex_mpa[nn_idx], 100.0, 30000.0)
+
+                # Export with FIXED CDB format — pass per-node EX values
                 base_name = name.replace('.cdb', '')
                 out_path = os.path.join(OUTPUT_DIR, f"generated_{base_name}.cdb")
                 write_cdb(out_path, nodes_arr[:, 1:4], elems,
-                         material_values=pred_material)
+                         material_values=node_ex)
                 exported_count += 1
 
             except Exception as e:
