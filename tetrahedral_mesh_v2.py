@@ -185,22 +185,22 @@ from sklearn.model_selection import KFold, GroupKFold
 from scipy.spatial import KDTree
 
 MODEL_CONFIG = {
-    'n_surface_pts': 2048,
-    'n_interior_pts': 4096,    # FIX Bug7: was 1024, GT has ~9000
-    'latent_dim': 256,         # was 128 — more capacity
-    'dgcnn_k': 20,             # was 16 — more neighbors for detail
+    'n_surface_pts': 4096,      # v3: doubled from 2048 — finer curvature capture
+    'n_interior_pts': 8192,     # P3: aligned with GT ~9000 (was 10k — overparameterized)
+    'latent_dim': 128,          # SMALL MODEL: was 512 — forces compression, reduces memorization
+    'dgcnn_k': 20,
     'input_dim': 6,
-    'batch_size': 4,           # back to 4 — safer with larger model
+    'batch_size': 4,            # SMALL MODEL: back to 4 — less VRAM needed, better gradients
     'epochs': 300,
-    'lr': 3e-4,                # was 5e-4 — slightly lower for stability
-    'lr_patience': 15,
-    'weight_decay': 1e-4,      # was 5e-3 — too aggressive for CVAE, kills KL learning
-    'kl_weight': 0.001,
-    'sizing_weight': 0.01,
-    'density_weight': 0.05,
-    'material_weight': 0.05,
+    'lr': 1e-4,                 # v3: stable for larger model
+    'lr_patience': 20,
+    'weight_decay': 1e-4,       # P4: restored from 5e-5 — fights overfitting
+    'kl_weight': 0.0,           # P0: CVAE→CAE — KL destroys reconstruction on N=198
+    'sizing_weight': 0.05,
+    'density_weight': 0.1,      # v3: stronger uniformity → less clustering
+    'material_weight': 0.1,     # reduced from 0.5 — was competing with CD
     'k_folds': 5,
-    'early_stop_patience': 50,  # was 40 — more patience
+    'early_stop_patience': 40,
 }
 
 # Global material normalization params — set during dataset creation
@@ -752,8 +752,34 @@ class MeshDataset(Dataset):
                 if pair.get('has_material', False):
                     n_with_mat += 1
         self._global_normalize_material()
+        # P1: Compute mean interior shape for template initialization
+        self.mean_interior = self._compute_mean_interior()
         print(f"  Dataset: {len(self.samples)} valid samples "
               f"({n_with_mat} with materials, {'augmented' if augment else 'eval'})")
+
+    def _compute_mean_interior(self):
+        """P1: Compute mean of all interior point clouds for decoder template.
+        
+        Instead of a random sphere, the decoder starts from the average bone
+        shape — it only needs to learn residual displacements per patient.
+        """
+        n_pts = MODEL_CONFIG['n_interior_pts']
+        acc = np.zeros((n_pts, 3), dtype=np.float64)
+        count = 0
+        for s in self.samples:
+            pts = s['interior']  # already normalized and sampled to n_pts
+            if len(pts) == n_pts:
+                acc += pts.astype(np.float64)
+                count += 1
+        if count > 0:
+            mean = (acc / count).astype(np.float32)
+            print(f"  📐 Mean interior template computed from {count} samples")
+            return mean
+        # Fallback: return random sphere if somehow no valid samples
+        rng = np.random.RandomState(42)
+        pts = rng.randn(n_pts, 3).astype(np.float32)
+        pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+        return pts * (rng.uniform(0, 1, (n_pts, 1)) ** (1/3)).astype(np.float32)
 
     def _global_normalize_material(self):
         global MATERIAL_NORM
@@ -858,7 +884,13 @@ def edge_features(x, k=20, idx=None):
     return torch.cat([neighbors - center, center], dim=3).permute(0, 3, 1, 2)
 
 class DGCNN(nn.Module):
-    def __init__(self, k=20, in_dim=6, out_dim=512):
+    """SMALL MODEL: 3-layer DGCNN (removed ec4).
+    
+    Output: 256*2 = 512D (was 512*2 = 1024D).
+    With N=198, 4 layers create unique fingerprints that enable memorization.
+    3 layers extract generalizable geometric features without overfitting.
+    """
+    def __init__(self, k=20, in_dim=6, out_dim=256):
         super().__init__()
         self.k = k
         self.ec1 = nn.Sequential(nn.Conv2d(in_dim * 2, 64, 1, bias=False),
@@ -867,18 +899,16 @@ class DGCNN(nn.Module):
                                  nn.GroupNorm(8, 128), nn.LeakyReLU(0.2))
         self.ec3 = nn.Sequential(nn.Conv2d(256, 256, 1, bias=False),
                                  nn.GroupNorm(16, 256), nn.LeakyReLU(0.2))
-        self.ec4 = nn.Sequential(nn.Conv2d(512, 512, 1, bias=False),
-                                 nn.GroupNorm(32, 512), nn.LeakyReLU(0.2))
-        self.agg = nn.Sequential(nn.Conv1d(64 + 128 + 256 + 512, out_dim, 1, bias=False),
-                                 nn.GroupNorm(32, out_dim), nn.LeakyReLU(0.2))
+        # ec4 REMOVED — was 512 channels, biggest memorization source
+        self.agg = nn.Sequential(nn.Conv1d(64 + 128 + 256, out_dim, 1, bias=False),
+                                 nn.GroupNorm(16, out_dim), nn.LeakyReLU(0.2))
 
     def forward(self, x):
         B = x.size(0)
         x1 = self.ec1(edge_features(x, self.k)).max(-1)[0]
         x2 = self.ec2(edge_features(x1, self.k)).max(-1)[0]
         x3 = self.ec3(edge_features(x2, self.k)).max(-1)[0]
-        x4 = self.ec4(edge_features(x3, self.k)).max(-1)[0]
-        x = self.agg(torch.cat([x1, x2, x3, x4], dim=1))
+        x = self.agg(torch.cat([x1, x2, x3], dim=1))
         g_max = F.adaptive_max_pool1d(x, 1).view(B, -1)
         g_avg = F.adaptive_avg_pool1d(x, 1).view(B, -1)
         return torch.cat([g_max, g_avg], dim=1)
@@ -888,33 +918,37 @@ class DGCNN(nn.Module):
 # SECTION 13: TRIPLE-HEAD DECODER + CVAE
 # ============================================================
 class TripleHeadDecoder(nn.Module):
-    def __init__(self, z_dim=512, cond_dim=1024, n_pts=4096):
+    """SMALL MODEL: 2-fold decoder with hidden=256 (was 3-fold, hidden=512).
+    
+    z_dim=128, cond_dim=512. Total decoder params: ~644K (was ~3.9M).
+    Sizing/material heads: 128→64→1 (was 256→128→1).
+    """
+    def __init__(self, z_dim=128, cond_dim=512, n_pts=8192):
         super().__init__()
         self.n_pts = n_pts
         self.register_buffer('template', self._init_template(n_pts))
-        inp = 3 + z_dim + cond_dim
+        inp = 3 + z_dim + cond_dim  # 3 + 128 + 512 = 643
         dropout_rate = 0.3
 
+        # 2 folding passes (removed fold3 + residual — too much capacity)
         self.fold1 = nn.Sequential(
-            nn.Linear(inp, 512), nn.ReLU(), nn.Dropout(dropout_rate),
-            nn.Linear(512, 512), nn.ReLU(), nn.Dropout(dropout_rate),
-            nn.Linear(512, 256), nn.ReLU(), nn.Dropout(dropout_rate),
+            nn.Linear(inp, 256), nn.ReLU(), nn.Dropout(dropout_rate),
+            nn.Linear(256, 256), nn.ReLU(), nn.Dropout(dropout_rate),
             nn.Linear(256, 3))
         self.fold2 = nn.Sequential(
-            nn.Linear(3 + z_dim + cond_dim, 512), nn.ReLU(), nn.Dropout(dropout_rate),
-            nn.Linear(512, 512), nn.ReLU(), nn.Dropout(dropout_rate),
-            nn.Linear(512, 256), nn.ReLU(), nn.Dropout(dropout_rate),
+            nn.Linear(3 + z_dim + cond_dim, 256), nn.ReLU(), nn.Dropout(dropout_rate),
+            nn.Linear(256, 256), nn.ReLU(), nn.Dropout(dropout_rate),
             nn.Linear(256, 3))
 
         self.sizing = nn.Sequential(
-            nn.Linear(3 + z_dim + cond_dim, 256), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(128, 1), nn.Sigmoid())
+            nn.Linear(3 + z_dim + cond_dim, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, 1), nn.Sigmoid())
 
         self.material = nn.Sequential(
-            nn.Linear(3 + z_dim + cond_dim, 256), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(128, 1), nn.Sigmoid())
+            nn.Linear(3 + z_dim + cond_dim, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, 1), nn.Sigmoid())
 
         self._init_sigmoid_heads()
 
@@ -927,12 +961,20 @@ class TripleHeadDecoder(nn.Module):
                         nn.init.zeros_(m.bias)
 
     def _init_template(self, n):
+        # Default fallback — will be replaced by mean shape via set_mean_template()
         rng = np.random.RandomState(42)
         pts = rng.randn(n * 3, 3)
         pts /= np.linalg.norm(pts, axis=1, keepdims=True)
         r = rng.uniform(0, 1, (len(pts), 1)) ** (1 / 3)
         pts = (pts * r)[:n]
         return torch.tensor(pts, dtype=torch.float32)
+
+    def set_mean_template(self, mean_pts):
+        """P1: Replace sphere template with data-driven mean bone shape."""
+        t = torch.tensor(mean_pts, dtype=torch.float32)
+        assert t.shape == (self.n_pts, 3), f"Template shape mismatch: {t.shape} vs ({self.n_pts}, 3)"
+        self.template.copy_(t)
+        print(f"  📐 Decoder template set to mean shape (replaces sphere)")
 
     def forward(self, z, cond):
         B = z.size(0)
@@ -952,8 +994,8 @@ class SurfaceToVolumeCVAE(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = DGCNN(k=MODEL_CONFIG['dgcnn_k'],
-                             in_dim=MODEL_CONFIG['input_dim'], out_dim=512)
-        enc_out = 1024
+                             in_dim=MODEL_CONFIG['input_dim'], out_dim=256)
+        enc_out = 512  # SMALL MODEL: 256*2 (max+avg pooling)
         self.fc_mu = nn.Linear(enc_out, MODEL_CONFIG['latent_dim'])
         self.fc_logvar = nn.Linear(enc_out, MODEL_CONFIG['latent_dim'])
         self.decoder = TripleHeadDecoder(MODEL_CONFIG['latent_dim'], enc_out,
@@ -999,8 +1041,8 @@ except Exception as e:
 # ============================================================
 # SECTION 14: LOSS FUNCTIONS
 # ============================================================
-def chamfer_distance(pred, target, chunk_size=256):
-    """Chunked Chamfer distance — chunk_size=256 to avoid OOM with 4096 pts."""
+def chamfer_distance(pred, target, chunk_size=512):  # v3: increased from 256 for 10k pts
+    """Chunked Chamfer distance — chunk_size=512 for v3 (10k pts)."""
     B, N, _ = pred.size()
     M = target.size(1)
     d_p2t = torch.zeros(B, N, device=pred.device)
@@ -1064,6 +1106,12 @@ def density_uniformity(pred_pos, n_subsample=512):
     return min_dists.std(1).mean()
 
 class MeshGenLoss(nn.Module):
+    """Simplified loss: CD + KL(=0) + density + sizing + material.
+    
+    P0: kl_weight=0 removes KL term → pure reconstruction (CAE mode).
+    Boundary loss removed — competed with CD gradients.
+    Material loss reverted to simple MSE — weighted version was unstable.
+    """
     def forward(self, pred_pos, pred_sizing, pred_material,
                 target_pos, target_sizing, target_material, mu, logvar):
         cd = chamfer_distance(pred_pos, target_pos)
@@ -1466,6 +1514,8 @@ def run_kfold(meshes):
                            num_workers=2 if IN_CLOUD else 0, pin_memory=torch.cuda.is_available())
 
         model = SurfaceToVolumeCVAE()
+        # P1: Replace sphere template with mean bone shape from training data
+        model.decoder.set_mean_template(full_ds.mean_interior)
         trainer = Trainer(model, tr_dl, va_dl, fold=fold + 1)
         hist = trainer.train()
 

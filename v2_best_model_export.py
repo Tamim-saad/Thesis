@@ -38,9 +38,9 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # MODEL ARCHITECTURE (must match training exactly)
 # ============================================================
 MODEL_CONFIG = {
-    'n_surface_pts': 2048,
-    'n_interior_pts': 4096,
-    'latent_dim': 256,
+    'n_surface_pts': 4096,
+    'n_interior_pts': 8192,
+    'latent_dim': 128,          # SMALL MODEL
     'dgcnn_k': 20,
     'input_dim': 6,
     'batch_size': 4,
@@ -65,7 +65,7 @@ def edge_features(x, k=20, idx=None):
     return torch.cat([neighbors - center, center], dim=3).permute(0, 3, 1, 2)
 
 class DGCNN(nn.Module):
-    def __init__(self, k=20, in_dim=6, out_dim=512):
+    def __init__(self, k=20, in_dim=6, out_dim=256):
         super().__init__()
         self.k = k
         self.ec1 = nn.Sequential(nn.Conv2d(in_dim * 2, 64, 1, bias=False),
@@ -74,42 +74,37 @@ class DGCNN(nn.Module):
                                  nn.GroupNorm(8, 128), nn.LeakyReLU(0.2))
         self.ec3 = nn.Sequential(nn.Conv2d(256, 256, 1, bias=False),
                                  nn.GroupNorm(16, 256), nn.LeakyReLU(0.2))
-        self.ec4 = nn.Sequential(nn.Conv2d(512, 512, 1, bias=False),
-                                 nn.GroupNorm(32, 512), nn.LeakyReLU(0.2))
-        self.agg = nn.Sequential(nn.Conv1d(64 + 128 + 256 + 512, out_dim, 1, bias=False),
-                                 nn.GroupNorm(32, out_dim), nn.LeakyReLU(0.2))
+        self.agg = nn.Sequential(nn.Conv1d(64 + 128 + 256, out_dim, 1, bias=False),
+                                 nn.GroupNorm(16, out_dim), nn.LeakyReLU(0.2))
     def forward(self, x):
         B = x.size(0)
         x1 = self.ec1(edge_features(x, self.k)).max(-1)[0]
         x2 = self.ec2(edge_features(x1, self.k)).max(-1)[0]
         x3 = self.ec3(edge_features(x2, self.k)).max(-1)[0]
-        x4 = self.ec4(edge_features(x3, self.k)).max(-1)[0]
-        x = self.agg(torch.cat([x1, x2, x3, x4], dim=1))
+        x = self.agg(torch.cat([x1, x2, x3], dim=1))
         g_max = F.adaptive_max_pool1d(x, 1).view(B, -1)
         g_avg = F.adaptive_avg_pool1d(x, 1).view(B, -1)
         return torch.cat([g_max, g_avg], dim=1)
 
 class TripleHeadDecoder(nn.Module):
-    def __init__(self, z_dim=512, cond_dim=1024, n_pts=4096):
+    def __init__(self, z_dim=128, cond_dim=512, n_pts=8192):
         super().__init__()
         self.n_pts = n_pts
         self.register_buffer('template', self._init_template(n_pts))
         inp = 3 + z_dim + cond_dim
         dr = 0.3
-        self.fold1 = nn.Sequential(nn.Linear(inp, 512), nn.ReLU(), nn.Dropout(dr),
-                                   nn.Linear(512, 512), nn.ReLU(), nn.Dropout(dr),
-                                   nn.Linear(512, 256), nn.ReLU(), nn.Dropout(dr),
+        self.fold1 = nn.Sequential(nn.Linear(inp, 256), nn.ReLU(), nn.Dropout(dr),
+                                   nn.Linear(256, 256), nn.ReLU(), nn.Dropout(dr),
                                    nn.Linear(256, 3))
-        self.fold2 = nn.Sequential(nn.Linear(3 + z_dim + cond_dim, 512), nn.ReLU(), nn.Dropout(dr),
-                                   nn.Linear(512, 512), nn.ReLU(), nn.Dropout(dr),
-                                   nn.Linear(512, 256), nn.ReLU(), nn.Dropout(dr),
+        self.fold2 = nn.Sequential(nn.Linear(3 + z_dim + cond_dim, 256), nn.ReLU(), nn.Dropout(dr),
+                                   nn.Linear(256, 256), nn.ReLU(), nn.Dropout(dr),
                                    nn.Linear(256, 3))
-        self.sizing = nn.Sequential(nn.Linear(3 + z_dim + cond_dim, 256), nn.ReLU(), nn.Dropout(0.2),
-                                    nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
-                                    nn.Linear(128, 1), nn.Sigmoid())
-        self.material = nn.Sequential(nn.Linear(3 + z_dim + cond_dim, 256), nn.ReLU(), nn.Dropout(0.2),
-                                      nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
-                                      nn.Linear(128, 1), nn.Sigmoid())
+        self.sizing = nn.Sequential(nn.Linear(3 + z_dim + cond_dim, 128), nn.ReLU(), nn.Dropout(0.2),
+                                    nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.2),
+                                    nn.Linear(64, 1), nn.Sigmoid())
+        self.material = nn.Sequential(nn.Linear(3 + z_dim + cond_dim, 128), nn.ReLU(), nn.Dropout(0.2),
+                                      nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.2),
+                                      nn.Linear(64, 1), nn.Sigmoid())
         self._init_sigmoid_heads()
 
     def _init_sigmoid_heads(self):
@@ -121,6 +116,7 @@ class TripleHeadDecoder(nn.Module):
                         nn.init.zeros_(m.bias)
 
     def _init_template(self, n):
+        # Default — will be overwritten by load_state_dict from checkpoint
         rng = np.random.RandomState(42)
         pts = rng.randn(n * 3, 3)
         pts /= np.linalg.norm(pts, axis=1, keepdims=True)
@@ -145,8 +141,8 @@ class SurfaceToVolumeCVAE(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = DGCNN(k=MODEL_CONFIG['dgcnn_k'],
-                             in_dim=MODEL_CONFIG['input_dim'], out_dim=512)
-        enc_out = 1024
+                             in_dim=MODEL_CONFIG['input_dim'], out_dim=256)
+        enc_out = 512  # SMALL MODEL: 256*2 (max+avg pooling)
         self.fc_mu = nn.Linear(enc_out, MODEL_CONFIG['latent_dim'])
         self.fc_logvar = nn.Linear(enc_out, MODEL_CONFIG['latent_dim'])
         self.decoder = TripleHeadDecoder(MODEL_CONFIG['latent_dim'], enc_out,
@@ -305,26 +301,48 @@ class MeshPrep:
 # ============================================================
 # FIXED TETRAHEDRALIZATION — NO ConvexHull
 # ============================================================
-def tetrahedralize_fixed(surf_pts, interior_pts):
-    """
-    Create tetrahedral mesh from surface + interior points.
-    
-    FIX: Does NOT use ConvexHull (which destroyed concave geometry).
-    Uses Delaunay triangulation on all points combined, then applies
-    alpha-shape filtering to remove exterior tetrahedra.
-    """
-    all_pts = np.vstack([surf_pts, interior_pts])
-    n_surf = len(surf_pts)
+# Try importing TetGen for quality mesh refinement
+try:
+    import tetgen as tg
+    HAS_TETGEN_LIB = True
+except ImportError:
+    HAS_TETGEN_LIB = False
+    print("  [INFO] tetgen library not found — will use scipy.Delaunay fallback (lower quality)")
 
-    # Delaunay tetrahedralization of all points
-    tri = Delaunay(all_pts)
+try:
+    import pyvista as pv
+    HAS_PYVISTA = True
+except ImportError:
+    HAS_PYVISTA = False
+
+
+def _laplacian_smooth(nodes, tets, n_surf, iterations=3, lam=0.3):
+    """Laplacian smoothing of interior nodes only (surface nodes pinned)."""
+    from collections import defaultdict
     
-    # Alpha-shape filtering: remove tets with edges that are too long
-    # (these are exterior tets that span across the surface)
-    # Compute median edge length to set adaptive threshold
-    simplices = tri.simplices
+    # Build adjacency graph
+    adj = defaultdict(set)
+    for tet in tets:
+        for i in range(4):
+            for j in range(i + 1, 4):
+                adj[tet[i]].add(tet[j])
+                adj[tet[j]].add(tet[i])
     
-    # Calculate edge lengths for each tet
+    positions = nodes.copy()
+    for _ in range(iterations):
+        new_pos = positions.copy()
+        for nid in range(n_surf, len(positions)):  # Only smooth interior nodes
+            neighbors = adj.get(nid, set())
+            if len(neighbors) == 0:
+                continue
+            center = np.mean(positions[list(neighbors)], axis=0)
+            new_pos[nid] = positions[nid] + lam * (center - positions[nid])
+        positions = new_pos
+    return positions
+
+
+def _alpha_filter_delaunay(all_pts, simplices, alpha_mult=6.0):
+    """Alpha-shape filtering on Delaunay result. Returns valid tet indices."""
     edge_pairs = [(0,1), (0,2), (0,3), (1,2), (1,3), (2,3)]
     all_edge_lengths = []
     tet_max_edges = np.zeros(len(simplices))
@@ -338,25 +356,136 @@ def tetrahedralize_fixed(surf_pts, interior_pts):
             max_edge = max(max_edge, edge_len)
         tet_max_edges[i] = max_edge
     
-    # Adaptive threshold: keep tets whose longest edge is within
-    # a reasonable multiple of the median (removes giant exterior tets)
     median_edge = np.median(all_edge_lengths)
-    alpha_threshold = median_edge * 4.0  # Generous to keep interior tets
+    alpha_threshold = median_edge * alpha_mult
     
-    valid_tets = []
-    for i, simp in enumerate(simplices):
-        if tet_max_edges[i] <= alpha_threshold:
-            valid_tets.append(tuple(simp))
+    valid = [i for i, me in enumerate(tet_max_edges) if me <= alpha_threshold]
+    return valid, alpha_threshold, median_edge
+
+
+def tetrahedralize_fixed(surf_pts, interior_pts):
+    """
+    Create tetrahedral mesh from surface + interior points.
     
-    print(f"    Delaunay: {len(simplices)} raw tets -> {len(valid_tets)} after alpha filter "
-          f"(threshold={alpha_threshold:.1f}mm, median_edge={median_edge:.1f}mm)")
+    STRATEGY (v3 — quality mesh):
+      1. Try TetGen with quality refinement (-q1.2 -a) for dense, clean tets
+      2. Fallback to scipy.Delaunay + alpha-shape if TetGen unavailable
+      3. Apply Laplacian smoothing to interior nodes
+    """
+    all_pts = np.vstack([surf_pts, interior_pts])
+    n_surf = len(surf_pts)
+    n_total_input = len(all_pts)
+
+    valid_tets = None
+    final_pts = None
+    method_used = "unknown"
+
+    # ── METHOD 1: TetGen with quality refinement ──
+    if HAS_TETGEN_LIB and HAS_PYVISTA:
+        try:
+            # Step A: Initial Delaunay + alpha to get a clean surface boundary
+            tri = Delaunay(all_pts)
+            valid_idx, alpha_th, med_edge = _alpha_filter_delaunay(
+                all_pts, tri.simplices, alpha_mult=6.0)
+            
+            if len(valid_idx) < 10:
+                raise ValueError("Alpha filter too aggressive")
+            
+            alpha_tets = tri.simplices[valid_idx]
+            
+            # Step B: Extract boundary surface from alpha-filtered mesh
+            from collections import Counter
+            face_count = Counter()
+            for tet in alpha_tets:
+                for tri_face in [(tet[0],tet[1],tet[2]), (tet[0],tet[1],tet[3]),
+                                 (tet[0],tet[2],tet[3]), (tet[1],tet[2],tet[3])]:
+                    face_count[tuple(sorted(tri_face))] += 1
+            surface_faces = [f for f, c in face_count.items() if c == 1]
+            
+            if len(surface_faces) < 4:
+                raise ValueError("No valid surface faces extracted")
+            
+            # Step C: Extract ONLY the vertices referenced by surface faces
+            # (TetGen fails if unreferenced interior points are included)
+            surf_node_ids = sorted(set(n for f in surface_faces for n in f))
+            old_to_new = {old: new for new, old in enumerate(surf_node_ids)}
+            surf_only_pts = all_pts[surf_node_ids]
+            
+            # Remap face indices to the compact surface vertex set
+            remapped_faces = []
+            for f in surface_faces:
+                remapped_faces.extend([3, old_to_new[f[0]], old_to_new[f[1]], old_to_new[f[2]]])
+            
+            surf_mesh = pv.PolyData(surf_only_pts, remapped_faces)
+            
+            # Step D: Compute target max volume from current mesh
+            tet_volumes = []
+            for tet in alpha_tets:
+                v0, v1, v2, v3 = all_pts[tet[0]], all_pts[tet[1]], all_pts[tet[2]], all_pts[tet[3]]
+                vol = abs(np.dot(v1 - v0, np.cross(v2 - v0, v3 - v0))) / 6.0
+                tet_volumes.append(vol)
+            median_vol = np.median(tet_volumes)
+            # Conservative: median/2 targets ~2-3x more elements (not /5 which explodes)
+            # Also floor by bounding box to prevent runaway on large geometries
+            bbox_vol = np.prod(all_pts.max(axis=0) - all_pts.min(axis=0))
+            vol_floor = bbox_vol / 50000.0  # At most ~50k elements from volume alone
+            max_vol = max(median_vol / 2.0, vol_floor, 1e-6)
+            print(f"    TetGen params: median_vol={median_vol:.2f}, max_vol={max_vol:.2f}, "
+                  f"bbox_vol={bbox_vol:.0f}, surface_verts={len(surf_only_pts)}")
+            
+            # Step E: Run TetGen with quality constraints
+            tet_gen = tg.TetGen(surf_mesh)
+            tet_gen.tetrahedralize(
+                order=1,
+                quality=True,
+                minratio=1.2,
+                maxvolume=max_vol,
+                nobisect=False,
+            )
+            grid = tet_gen.grid
+            
+            # Extract nodes and elements from TetGen output
+            final_pts = np.array(grid.points)
+            cells = grid.cells.reshape(-1, 5)  # (n_tets, 5): [4, n0, n1, n2, n3]
+            valid_tets = [tuple(c[1:]) for c in cells]
+            method_used = "TetGen"
+            
+            print(f"    TetGen: {len(alpha_tets)} alpha tets → {len(valid_tets)} refined tets "
+                  f"(max_vol={max_vol:.4f}, nodes: {n_total_input} → {len(final_pts)})")
+            
+        except Exception as e:
+            print(f"    TetGen failed ({e}), falling back to scipy.Delaunay")
+            valid_tets = None  # Force fallback
+
+    # ── METHOD 2: Fallback — scipy.Delaunay + alpha-shape ──
+    if valid_tets is None:
+        tri = Delaunay(all_pts)
+        valid_idx, alpha_th, med_edge = _alpha_filter_delaunay(
+            all_pts, tri.simplices, alpha_mult=6.0)
+        
+        if len(valid_idx) == 0:
+            print(f"    Warning: alpha filter too aggressive, using all {len(tri.simplices)} tets")
+            valid_tets = [tuple(simp) for simp in tri.simplices]
+        else:
+            valid_tets = [tuple(tri.simplices[i]) for i in valid_idx]
+        
+        final_pts = all_pts
+        method_used = "scipy.Delaunay"
+        
+        print(f"    Delaunay: {len(tri.simplices)} raw tets -> {len(valid_tets)} after alpha filter "
+              f"(threshold={alpha_th:.1f}, median_edge={med_edge:.1f})")
+
+    # ── POST-PROCESSING: Laplacian smoothing ──
+    try:
+        smoothed = _laplacian_smooth(final_pts, valid_tets, n_surf, iterations=3, lam=0.3)
+        final_pts = smoothed
+        print(f"    Smoothing: 3 iterations (λ=0.3), surface nodes pinned")
+    except Exception as e:
+        print(f"    Smoothing skipped: {e}")
     
-    if len(valid_tets) == 0:
-        # Fallback: use all tets if filtering removed everything
-        print(f"    Warning: alpha filter too aggressive, using all {len(simplices)} tets")
-        valid_tets = [tuple(simp) for simp in simplices]
+    print(f"    Final: {len(final_pts)} nodes, {len(valid_tets)} elements (method={method_used})")
     
-    nodes_arr = np.column_stack([np.arange(len(all_pts)), all_pts])
+    nodes_arr = np.column_stack([np.arange(len(final_pts)), final_pts])
     return nodes_arr, valid_tets
 
 
@@ -596,7 +725,7 @@ def export_all(model, data_dir, output_dir):
             with torch.no_grad():
                 pred_pos, pred_sz, pred_mat, _, _ = model(surf_t)
             
-            pred_interior = pred_pos.cpu().numpy()[0]  # (4096, 3) normalized
+            pred_interior = pred_pos.cpu().numpy()[0]  # (8192, 3) normalized
             
             # 4. Denormalize
             surf_real = sample['surface'] * sample['scale'] + sample['centroid']
@@ -666,8 +795,11 @@ def run_export(model_path=None, data_dir=None, output_dir=None):
     # ── Model path ──
     if model_path is None:
         search = [
+            '/content/drive/MyDrive/thesis/thesis_output/v2_output/model_fold2.pt',  # New standard path
             '/content/drive/MyDrive/thesis/thesis_output/model_fold2.pt',
             '/content/drive/MyDrive/thesis/model_fold2.pt',
+            '/content/model_fold2.pt',           # Uploaded directly to /content
+            '/content/drive/MyDrive/model_fold2.pt',
             './thesis_output/model_fold2.pt',
             './model_fold2.pt',
         ]
@@ -677,12 +809,16 @@ def run_export(model_path=None, data_dir=None, output_dir=None):
         if model_path is None:
             print("[ERROR] Model not found. Searched:")
             for c in search: print(f"  {c}")
+            print("\n  ▶ Fix: Upload model_fold2.pt to Google Drive and set the path:")
+            print("    run_export(model_path='/content/drive/MyDrive/your_path/model_fold2.pt')")
             return
 
     # ── Data directory ──
     if data_dir is None:
         search = [
             '/content/drive/MyDrive/thesis/4_bonemat_cdb_files',
+            '/content/drive/MyDrive/thesis/thesis_output/4_bonemat_cdb_files',
+            '/content/4_bonemat_cdb_files',     # Uploaded directly to /content
             './4_bonemat_cdb_files',
         ]
         for c in search:
