@@ -60,7 +60,7 @@ else:
     print('💻 Local environment')
 
 if IN_COLAB:
-    OUTPUT_DIR = '/content/drive/MyDrive/thesis/me/tetra/thesis_output/'
+    OUTPUT_DIR = '/content/drive/MyDrive/thesis/thesis_output/'
 elif IN_KAGGLE:
     OUTPUT_DIR = '/kaggle/working/thesis_output/'
 else:
@@ -125,13 +125,12 @@ print(f'  TetGen: {"✅" if HAS_TETGEN else "❌"}')
 # SECTION 3: CONFIGURATION
 # ============================================================
 def _auto_detect_data_dir():
-    for path in ['/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files',
-                 '/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files',
+    for path in ['/content/drive/MyDrive/thesis/4_bonemat_cdb_files',
                  '/kaggle/input/femur-cdb-files', './4_bonemat_cdb_files', '../4_bonemat_cdb_files']:
         if os.path.isdir(path) and len(glob.glob(os.path.join(path, '*.cdb'))) > 0:
             print(f'  📂 Data: {path} ({len(glob.glob(os.path.join(path, "*.cdb")))} CDB files)')
             return path
-    return '/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files' if IN_COLAB else './4_bonemat_cdb_files'
+    return '/content/drive/MyDrive/thesis/4_bonemat_cdb_files' if IN_COLAB else './4_bonemat_cdb_files'
 
 DATA_DIR = _auto_detect_data_dir()
 
@@ -147,9 +146,10 @@ MODEL_CONFIG = {
     'lr': 5e-4,                  # higher LR for smaller model
     'lr_patience': 25,
     'weight_decay': 1e-4,
-    'displacement_weight': 1.0,  # L1 on displacements
+    'chamfer_weight': 1.0,       # CD on predicted positions vs GT interior
     'material_weight': 0.1,      # MSE on materials
-    'chamfer_weight': 0.5,       # auxiliary CD on final positions
+    'disp_reg_weight': 0.01,     # Soft L2 penalty on displacement magnitude
+    'disp_scale': 0.3,           # Output range ±0.3 (baseline CD ~ 0.18)
     'k_folds': 5,
     'early_stop_patience': 40,
     'dgcnn_k': 20,
@@ -388,11 +388,17 @@ class TemplateDeformDataset(Dataset):
       - target_material = material at nearest GT interior point
     """
 
-    def __init__(self, meshes, augment=False, template=None):
+    def __init__(self, meshes, augment=False):
+        """Process meshes and normalize materials. Template NOT computed here to
+        prevent data leakage — computed per-fold in run_kfold() from training only."""
         self.augment = augment
+        self.template = None  # Set per-fold
         self.samples, self.names = [], []
         n_s = MODEL_CONFIG['n_surface_pts']
         n_i = MODEL_CONFIG['n_interior_pts']
+
+        # Fixed seed for reproducible preprocessing
+        np.random.seed(42)
 
         n_mat = 0
         for name, m in meshes.items():
@@ -402,20 +408,14 @@ class TemplateDeformDataset(Dataset):
                 self.names.append(name)
                 if pair['has_material']: n_mat += 1
 
-        # Normalize materials globally
+        # Normalize materials globally and save normalization
         self._normalize_materials()
+        self._save_material_norm()
 
-        # Compute or use provided template
-        if template is not None:
-            self.template = template
-        else:
-            self.template = self._compute_template()
+        np.random.seed(None)
 
-        # Compute displacement targets for each sample
-        self._compute_targets()
-
-        print(f"  Dataset: {len(self.samples)} samples ({n_mat} with materials, "
-              f"{'augmented' if augment else 'eval'})")
+        print(f"  Dataset: {len(self.samples)} samples ({n_mat} with materials)")
+        print(f"  Patients: {len(set(_extract_patient_id(n) for n in self.names))} unique")
 
     def _normalize_materials(self):
         global MATERIAL_NORM
@@ -438,50 +438,18 @@ class TemplateDeformDataset(Dataset):
             m = s['material']
             s['material'] = np.where(m > 0, np.clip((m - gmin) / grange, 0, 1), 0).astype(np.float32)
 
-    def _compute_template(self):
-        """Compute mean of all interior point clouds as the template.
-        Uses a FIXED seed so the template is reproducible and saves immediately.
-        """
-        n = MODEL_CONFIG['n_interior_pts']
-        acc = np.zeros((n, 3), dtype=np.float64)
-        cnt = 0
-        for s in self.samples:
-            if len(s['interior']) == n:
-                acc += s['interior'].astype(np.float64)
-                cnt += 1
-        if cnt > 0:
-            template = (acc / cnt).astype(np.float32)
-            print(f"  📐 Template computed from {cnt} samples (mean bone shape)")
-        else:
-            # Fallback: unit sphere
-            rng = np.random.RandomState(42)
-            pts = rng.randn(n, 3).astype(np.float32)
-            pts /= np.linalg.norm(pts, axis=1, keepdims=True)
-            template = pts * (rng.uniform(0, 1, (n, 1)) ** (1/3)).astype(np.float32)
-            print(f"  📐 Template: fallback unit sphere ({n} pts)")
-
-        # Save template immediately so export can use it
-        tpl_path = os.path.join(OUTPUT_DIR, 'v3_template.npy')
-        np.save(tpl_path, template)
-        print(f"  💾 Template saved: {tpl_path}")
-        return template
-
-    def _compute_targets(self):
-        """For each template point, find nearest GT interior point → displacement + material."""
-        template = self.template
-        for s in self.samples:
-            gt_int = s['interior']  # (n_int, 3)
-            gt_mat = s['material']  # (n_int,)
-            tree = KDTree(gt_int)
-            _, idx = tree.query(template, k=1)
-            s['target_pos'] = gt_int[idx].astype(np.float32)      # (n_int, 3)
-            s['target_disp'] = (gt_int[idx] - template).astype(np.float32)  # (n_int, 3)
-            s['target_mat'] = gt_mat[idx].astype(np.float32)      # (n_int,)
+    def _save_material_norm(self):
+        """Save material normalization to disk so export can denormalize."""
+        norm_path = os.path.join(OUTPUT_DIR, 'v3_material_norm.npy')
+        np.save(norm_path, np.array([MATERIAL_NORM.get('global_min', 0.0),
+                                     MATERIAL_NORM.get('global_max', 4.3)]))
+        print(f"  💾 Material norm saved: {norm_path}")
 
     def __len__(self):
         return len(self.samples)
 
-    def _random_rotation(self):
+    @staticmethod
+    def _random_rotation():
         angles = np.random.uniform(0, 2*np.pi, 3)
         cx, sx = np.cos(angles[0]), np.sin(angles[0])
         cy, sy = np.cos(angles[1]), np.sin(angles[1])
@@ -492,38 +460,8 @@ class TemplateDeformDataset(Dataset):
         return (Rz @ Ry @ Rx).astype(np.float32)
 
     def __getitem__(self, idx):
-        s = self.samples[idx]
-        surface = s['surface'].copy()              # (n_surf, 6)
-        template = self.template.copy()            # (n_int, 3)
-        target_pos = s['target_pos'].copy()        # (n_int, 3)
-        target_mat = s['target_mat'].copy()        # (n_int,)
-
-        if self.augment:
-            R = self._random_rotation()
-            sc = 1.0 + (np.random.rand(3) * 0.2 - 0.1)  # ±10% per axis
-            # Apply rotation + scale to all geometry
-            surface[:, :3] = (surface[:, :3] @ R.T) * sc
-            surface[:, 3:] = surface[:, 3:] @ R.T
-            nrm = np.linalg.norm(surface[:, 3:], axis=1, keepdims=True)
-            surface[:, 3:] /= np.maximum(nrm, 1e-10)
-            template = (template @ R.T) * sc
-            target_pos = (target_pos @ R.T) * sc
-            # Random axis flips
-            for ax in range(3):
-                if np.random.random() > 0.5:
-                    surface[:, ax] *= -1; surface[:, ax+3] *= -1
-                    template[:, ax] *= -1; target_pos[:, ax] *= -1
-            # Small jitter on surface
-            surface[:, :3] += np.random.randn(*surface[:, :3].shape).astype(np.float32) * 0.003
-
-        # Displacement is always relative to (augmented) template
-        target_disp = target_pos - template
-
-        return (torch.tensor(surface, dtype=torch.float32),
-                torch.tensor(template, dtype=torch.float32),
-                torch.tensor(target_disp, dtype=torch.float32),
-                torch.tensor(target_mat, dtype=torch.float32),
-                self.names[idx])
+        # This is only used if template was set externally (legacy path)
+        raise NotImplementedError("Use _SubDataset with per-fold template")
 
 
 # ============================================================
@@ -663,6 +601,9 @@ class TemplateDeformNet(nn.Module):
         disp = self.disp_head(node_input)           # (B, T, 3)
         mat = self.mat_head(node_input).squeeze(-1)  # (B, T)
 
+        # Scale displacement so model can make meaningful deformations
+        disp = disp * MODEL_CONFIG['disp_scale']
+
         return disp, mat
 
 
@@ -700,40 +641,43 @@ print(f'✅ Model verified: {n_params:,} parameters')
 # SECTION 9: LOSS FUNCTIONS
 # ============================================================
 def chamfer_distance(pred, target, chunk=512):
-    """Chunked symmetric Chamfer Distance."""
+    """Chunked symmetric Chamfer Distance using L2 (not squared L2)."""
     B, N, _ = pred.size()
     M = target.size(1)
     # pred→target
     min_p2t = torch.full((B, N), 1e6, device=pred.device)
     for i in range(0, N, chunk):
-        d = (pred[:, i:i+chunk].unsqueeze(2) - target.unsqueeze(1)).pow(2).sum(-1)
+        d = (pred[:, i:i+chunk].unsqueeze(2) - target.unsqueeze(1)).pow(2).sum(-1).sqrt()
         min_p2t[:, i:i+chunk] = d.min(2)[0]
     # target→pred
     min_t2p = torch.full((B, M), 1e6, device=pred.device)
     for i in range(0, M, chunk):
-        d = (target[:, i:i+chunk].unsqueeze(2) - pred.unsqueeze(1)).pow(2).sum(-1)
+        d = (target[:, i:i+chunk].unsqueeze(2) - pred.unsqueeze(1)).pow(2).sum(-1).sqrt()
         min_t2p[:, i:i+chunk] = d.min(2)[0]
     return (min_p2t.mean(1) + min_t2p.mean(1)).mean()
 
 
 class DeformLoss(nn.Module):
-    """Loss = L1(displacement) + MSE(material) + CD(final_pos, target_pos)."""
-    def forward(self, pred_disp, pred_mat, target_disp, target_mat, template):
-        # L1 on displacements — robust to outliers
-        disp_loss = F.l1_loss(pred_disp, target_disp)
+    """Loss = CD(predicted_pos, GT_interior) + MSE(material) + disp_reg.
+    CD handles correspondence automatically. Soft L2 reg prevents displacement explosion.
+    """
+    def forward(self, pred_disp, pred_mat, target_pos, target_mat, template):
+        # Predicted final positions
+        pred_pos = template + pred_disp
+        # Chamfer distance against raw GT interior (CD handles correspondence)
+        cd = chamfer_distance(pred_pos, target_pos)
         # MSE on materials
         mat_loss = F.mse_loss(pred_mat, target_mat)
-        # Chamfer distance on final positions (auxiliary metric)
-        pred_pos = template + pred_disp
-        target_pos = template + target_disp
-        cd = chamfer_distance(pred_pos, target_pos)
+        # Soft L2 displacement regularization — prevents overfitting via wild displacements
+        disp_reg = pred_disp.pow(2).mean()
 
-        total = (MODEL_CONFIG['displacement_weight'] * disp_loss
+        total = (MODEL_CONFIG['chamfer_weight'] * cd
                  + MODEL_CONFIG['material_weight'] * mat_loss
-                 + MODEL_CONFIG['chamfer_weight'] * cd)
+                 + MODEL_CONFIG['disp_reg_weight'] * disp_reg)
         return total, {
-            'disp': disp_loss.item(), 'mat': mat_loss.item(),
-            'cd': cd.item(), 'total': total.item()
+            'cd': cd.item(), 'mat': mat_loss.item(),
+            'disp_mag': pred_disp.detach().norm(dim=-1).mean().item(),
+            'total': total.item()
         }
 
 
@@ -756,13 +700,13 @@ class Trainer:
     def _run_epoch(self, dl, train=True):
         self.model.train(train)
         total_l, total_cd, n = 0.0, 0.0, 0
-        for surf, template, target_disp, target_mat, _ in dl:
+        for surf, template, target_pos, target_mat, _ in dl:
             surf = surf.to(DEVICE)
             template = template.to(DEVICE)
-            target_disp = target_disp.to(DEVICE)
+            target_pos = target_pos.to(DEVICE)
             target_mat = target_mat.to(DEVICE)
             pred_disp, pred_mat = self.model(surf, template)
-            loss, metrics = self.loss_fn(pred_disp, pred_mat, target_disp, target_mat, template)
+            loss, metrics = self.loss_fn(pred_disp, pred_mat, target_pos, target_mat, template)
             if train:
                 if torch.isnan(loss) or torch.isinf(loss):
                     print("    ⚠️ NaN/Inf loss, skipping batch"); continue
@@ -811,40 +755,74 @@ class Trainer:
         return history
 
     def save_model(self, path):
-        torch.save(self.model.state_dict(), path)
-        print(f"  💾 Model saved: {path}")
+        """Save full checkpoint: model weights + material normalization."""
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'material_norm': {
+                'global_min': MATERIAL_NORM.get('global_min'),
+                'global_max': MATERIAL_NORM.get('global_max'),
+            },
+            'config': MODEL_CONFIG,
+        }
+        torch.save(checkpoint, path)
+        print(f"  💾 Checkpoint saved: {path} (model + material_norm)")
 
 
 # ============================================================
 # SECTION 11: EVALUATION
 # ============================================================
-def evaluate_model(model, dataset):
-    """Evaluate model on a dataset, return per-sample metrics."""
+def evaluate_model(model, dataset, template_np):
+    """Evaluate model on a dataset with enhanced metrics + zero-displacement baseline."""
     model.eval()
     results = []
     for i in range(len(dataset)):
-        surf, template, target_disp, target_mat, name = dataset[i]
+        surf, template, target_pos_t, target_mat, name = dataset[i]
         surf = surf.unsqueeze(0).to(DEVICE)
         template = template.unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             pred_disp, pred_mat = model(surf, template)
+
         pred_pos = (template + pred_disp)[0].cpu().numpy()
-        target_pos = (template.cpu() + target_disp.unsqueeze(0))[0].numpy()
-        # Chamfer distance
+        target_pos = target_pos_t.numpy()  # Raw GT interior positions
+        pred_d = pred_disp[0].cpu().numpy()
+
+        # Chamfer distance (model prediction vs raw GT)
         tree_t = KDTree(target_pos)
         tree_p = KDTree(pred_pos)
         d_pt, _ = tree_p.query(target_pos)
         d_tp, _ = tree_t.query(pred_pos)
         cd = (d_pt.mean() + d_tp.mean()) / 2
-        # Hausdorff
         hd = max(d_pt.max(), d_tp.max())
+
+        # Zero-displacement BASELINE: CD of template itself vs raw GT
+        d_bt, _ = tree_t.query(template_np)  # template→GT
+        tree_tpl = KDTree(template_np)
+        d_tb, _ = tree_tpl.query(target_pos)  # GT→template
+        baseline_cd = (d_bt.mean() + d_tb.mean()) / 2
+
+        # Displacement magnitude stats
+        disp_mag = np.linalg.norm(pred_d, axis=1)
+        disp_mean = float(disp_mag.mean())
+        disp_max = float(disp_mag.max())
+
+        # Point-wise RMSE (pred vs nearest GT — since sizes may differ)
+        d_p2t_rmse, _ = tree_t.query(pred_pos)
+        rmse = float(np.sqrt(np.mean(d_p2t_rmse**2)))
+
         # Material
         pm = pred_mat[0].cpu().numpy()
         tm = target_mat.numpy()
         mat_mse = float(np.mean((pm - tm)**2))
         mat_mae = float(np.mean(np.abs(pm - tm)))
-        results.append({'name': name, 'chamfer': cd, 'hausdorff': hd,
-                        'material_mse': mat_mse, 'material_mae': mat_mae})
+
+        results.append({
+            'name': name, 'chamfer': cd, 'hausdorff': hd,
+            'baseline_cd': baseline_cd,
+            'improvement': 1.0 - (cd / max(baseline_cd, 1e-10)),
+            'disp_mean': disp_mean, 'disp_max': disp_max,
+            'rmse': rmse,
+            'material_mse': mat_mse, 'material_mae': mat_mae,
+        })
     return results
 
 
@@ -906,9 +884,96 @@ def write_cdb(filepath, nodes, tets, material_values=None, poisson=0.3):
 # ============================================================
 # SECTION 13: K-FOLD CROSS-VALIDATION
 # ============================================================
+class _SubDataset(Dataset):
+    """Fold-specific dataset: uses per-fold template (training-only), computes targets."""
+    def __init__(self, parent, indices, template, augment=False):
+        self.samples = [parent.samples[i] for i in indices]
+        self.names = [parent.names[i] for i in indices]
+        self.template = template  # Per-fold template (from training samples ONLY)
+        self.augment = augment
+        # Pre-compute targets relative to this fold's template
+        self._compute_targets()
+
+    def _compute_targets(self):
+        """Store raw GT interior + material for CD-based loss (no NN mapping).
+        Also keep NN-mapped material for template-point-based evaluation.
+        """
+        for s in self.samples:
+            gt_int = s['interior']   # (n_int, 3)
+            gt_mat = s['material']   # (n_int,)
+            # Raw GT interior positions — used as CD target (no NN noise)
+            s['target_pos'] = gt_int.astype(np.float32)
+            s['target_mat_raw'] = gt_mat.astype(np.float32)
+            # NN-mapped material for template points (used for material head supervision)
+            tree = KDTree(gt_int)
+            _, idx = tree.query(self.template, k=1)
+            s['target_mat'] = gt_mat[idx].astype(np.float32)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        surface = s['surface'].copy()
+        template = self.template.copy()
+        target_pos = s['target_pos'].copy()  # Raw GT interior (for CD)
+        target_mat = s['target_mat'].copy()  # NN-mapped material (for template pts)
+
+        if self.augment:
+            R = TemplateDeformDataset._random_rotation()
+            sc = 1.0 + np.random.uniform(-0.05, 0.05)
+            surface[:, :3] = (surface[:, :3] @ R.T) * sc
+            surface[:, 3:] = surface[:, 3:] @ R.T
+            nrm = np.linalg.norm(surface[:, 3:], axis=1, keepdims=True)
+            surface[:, 3:] /= np.maximum(nrm, 1e-10)
+            template = (template @ R.T) * sc
+            target_pos = (target_pos @ R.T) * sc
+            if np.random.random() > 0.5:
+                surface[:, 0] *= -1; surface[:, 3] *= -1
+                template[:, 0] *= -1; target_pos[:, 0] *= -1
+            surface[:, :3] += np.random.randn(*surface[:, :3].shape).astype(np.float32) * 0.002
+
+        return (torch.tensor(surface, dtype=torch.float32),
+                torch.tensor(template, dtype=torch.float32),
+                torch.tensor(target_pos, dtype=torch.float32),   # raw GT for CD
+                torch.tensor(target_mat, dtype=torch.float32),   # NN-mapped mat
+                self.names[idx])
+
 def _extract_patient_id(name):
     base = name.replace('_bonemat.cdb', '').replace('_re', '')
     return base.split('_')[0]
+
+def _compute_template_from_indices(full_ds, indices):
+    """Compute mean template from ONLY the specified sample indices (training-only)."""
+    n = MODEL_CONFIG['n_interior_pts']
+    acc = np.zeros((n, 3), dtype=np.float64)
+    cnt = 0
+    for i in indices:
+        interior = full_ds.samples[i]['interior']
+        if len(interior) == n:
+            acc += interior.astype(np.float64)
+            cnt += 1
+    if cnt > 0:
+        return (acc / cnt).astype(np.float32), cnt
+    # Fallback
+    rng = np.random.RandomState(42)
+    pts = rng.randn(n, 3).astype(np.float32)
+    pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+    return pts * (rng.uniform(0, 1, (n, 1)) ** (1/3)).astype(np.float32), 0
+
+
+def _zero_baseline_cd(template, full_ds, val_indices):
+    """Compute CD between template (zero displacement) and each validation sample."""
+    tree_tpl = KDTree(template)
+    baseline_cds = []
+    for vi in val_indices:
+        gt_int = full_ds.samples[vi]['interior']  # (n_int, 3)
+        tree_gt = KDTree(gt_int)
+        d_t2g, _ = tree_gt.query(template)   # template → GT
+        d_g2t, _ = tree_tpl.query(gt_int)    # GT → template
+        baseline_cds.append((d_t2g.mean() + d_g2t.mean()) / 2)
+    return np.array(baseline_cds)
+
 
 def run_kfold(meshes):
     print("\n" + "=" * 60)
@@ -922,7 +987,6 @@ def run_kfold(meshes):
     patient_ids = [_extract_patient_id(name) for name in full_ds.names]
     unique_patients = sorted(set(patient_ids))
     n_patients = len(unique_patients)
-    print(f"  Patients: {n_patients} unique (from {n} samples)")
 
     pid_to_group = {pid: i for i, pid in enumerate(unique_patients)}
     groups = np.array([pid_to_group[pid] for pid in patient_ids])
@@ -933,23 +997,28 @@ def run_kfold(meshes):
     for fold, (tr_idx, va_idx) in enumerate(gkf.split(range(n), groups=groups)):
         tr_patients = set(patient_ids[i] for i in tr_idx)
         va_patients = set(patient_ids[i] for i in va_idx)
-        assert len(tr_patients & va_patients) == 0, "Data leakage!"
+        assert len(tr_patients & va_patients) == 0, "Patient-level data leakage!"
         print(f"\n{'='*50}")
         print(f"  FOLD {fold+1}/{k} | train={len(tr_idx)} ({len(tr_patients)} patients) "
               f"| val={len(va_idx)} ({len(va_patients)} patients)")
 
-        # Create fold datasets sharing the same template
-        tr_ds = TemplateDeformDataset.__new__(TemplateDeformDataset)
-        tr_ds.samples = [full_ds.samples[i] for i in tr_idx]
-        tr_ds.names = [full_ds.names[i] for i in tr_idx]
-        tr_ds.template = full_ds.template
-        tr_ds.augment = True
+        # ★ FIX: Per-fold template from TRAINING samples ONLY
+        template, tpl_cnt = _compute_template_from_indices(full_ds, tr_idx)
+        print(f"  📐 Template: mean of {tpl_cnt} TRAINING samples (no val leakage)")
 
-        va_ds = TemplateDeformDataset.__new__(TemplateDeformDataset)
-        va_ds.samples = [full_ds.samples[i] for i in va_idx]
-        va_ds.names = [full_ds.names[i] for i in va_idx]
-        va_ds.template = full_ds.template
-        va_ds.augment = False
+        # ★ FIX: Zero-displacement BASELINE
+        baseline_cds = _zero_baseline_cd(template, full_ds, va_idx)
+        print(f"  📏 Zero-displacement baseline val CD: {baseline_cds.mean():.6f} "
+              f"(±{baseline_cds.std():.6f})")
+
+        # Save per-fold template
+        tpl_path = os.path.join(OUTPUT_DIR, f'v3_template_fold{fold+1}.npy')
+        np.save(tpl_path, template)
+        print(f"  💾 Template saved: {tpl_path}")
+
+        # Create fold datasets with per-fold template
+        tr_ds = _SubDataset(full_ds, tr_idx, template, augment=True)
+        va_ds = _SubDataset(full_ds, va_idx, template, augment=False)
 
         bs = MODEL_CONFIG['batch_size']
         tr_dl = DataLoader(tr_ds, bs, shuffle=True, drop_last=len(tr_ds) > bs,
@@ -964,13 +1033,33 @@ def run_kfold(meshes):
         save_path = os.path.join(OUTPUT_DIR, f'model_v3_fold{fold+1}.pt')
         trainer.save_model(save_path)
 
-        metrics = evaluate_model(model, va_ds)
+        # ★ FIX: Enhanced evaluation with baseline comparison
+        metrics = evaluate_model(model, va_ds, template)
+        mean_cd = np.mean([m['chamfer'] for m in metrics])
+        mean_baseline = np.mean([m['baseline_cd'] for m in metrics])
+        mean_improve = np.mean([m['improvement'] for m in metrics])
+        mean_disp = np.mean([m['disp_mean'] for m in metrics])
+
+        print(f"\n  📊 FOLD {fold+1} EVALUATION:")
+        print(f"  {'Metric':<25s} {'Value':>10s}")
+        print(f"  {'-'*40}")
+        print(f"  {'Model CD':<25s} {mean_cd:>10.6f}")
+        print(f"  {'Baseline CD (zero-disp)':<25s} {mean_baseline:>10.6f}")
+        print(f"  {'Improvement over base':<25s} {mean_improve*100:>9.1f}%")
+        print(f"  {'Mean displacement':<25s} {mean_disp:>10.6f}")
+        print(f"  {'Mean RMSE':<25s} {np.mean([m['rmse'] for m in metrics]):>10.6f}")
+        print(f"  {'Mean HD':<25s} {np.mean([m['hausdorff'] for m in metrics]):>10.6f}")
+        print(f"  {'Material MAE':<25s} {np.mean([m['material_mae'] for m in metrics]):>10.6f}")
+
         fold_results.append({
             'fold': fold+1, 'history': hist, 'metrics': metrics,
-            'model_path': save_path,
-            'mean_cd': np.mean([m['chamfer'] for m in metrics]),
+            'model_path': save_path, 'template_path': tpl_path,
+            'mean_cd': mean_cd,
+            'mean_baseline_cd': mean_baseline,
+            'mean_improvement': mean_improve,
             'mean_hd': np.mean([m['hausdorff'] for m in metrics]),
             'mean_mat_mae': np.mean([m['material_mae'] for m in metrics]),
+            'mean_disp': mean_disp,
         })
 
         del model, trainer, tr_dl, va_dl
@@ -982,17 +1071,25 @@ def run_kfold(meshes):
     print("📊 K-FOLD RESULTS SUMMARY")
     print("=" * 60)
     cds = [r['mean_cd'] for r in fold_results]
+    bls = [r['mean_baseline_cd'] for r in fold_results]
+    imps = [r['mean_improvement'] for r in fold_results]
     hds = [r['mean_hd'] for r in fold_results]
     mma = [r['mean_mat_mae'] for r in fold_results]
-    print(f"  Chamfer:    {np.mean(cds):.6f} ± {np.std(cds):.6f}")
-    print(f"  Hausdorff:  {np.mean(hds):.6f} ± {np.std(hds):.6f}")
-    print(f"  Mat MAE:    {np.mean(mma):.6f} ± {np.std(mma):.6f}")
-    print(f"  Patients:   {n_patients} total, {k}-fold grouped")
+    disp = [r['mean_disp'] for r in fold_results]
+    print(f"  {'Metric':<30s} {'Mean':>10s} {'± Std':>10s}")
+    print(f"  {'-'*55}")
+    print(f"  {'Model CD':<30s} {np.mean(cds):>10.6f} ±{np.std(cds):>9.6f}")
+    print(f"  {'Baseline CD (zero-disp)':<30s} {np.mean(bls):>10.6f} ±{np.std(bls):>9.6f}")
+    print(f"  {'Improvement %':<30s} {np.mean(imps)*100:>9.1f}% ±{np.std(imps)*100:>8.1f}%")
+    print(f"  {'Hausdorff':<30s} {np.mean(hds):>10.6f} ±{np.std(hds):>9.6f}")
+    print(f"  {'Material MAE':<30s} {np.mean(mma):>10.6f} ±{np.std(mma):>9.6f}")
+    print(f"  {'Mean Displacement':<30s} {np.mean(disp):>10.6f} ±{np.std(disp):>9.6f}")
+    print(f"  {'Patients':<30s} {n_patients} total, {k}-fold grouped")
 
-    # Save template for export
-    template_path = os.path.join(OUTPUT_DIR, 'v3_template.npy')
-    np.save(template_path, full_ds.template)
-    print(f"  💾 Template saved: {template_path}")
+    best = min(fold_results, key=lambda x: x['mean_cd'])
+    print(f"\n  🏆 Best fold: {best['fold']} | CD: {best['mean_cd']:.6f}")
+    print(f"     Template: {best['template_path']}")
+    print(f"     Model:    {best['model_path']}")
 
     return fold_results
 
