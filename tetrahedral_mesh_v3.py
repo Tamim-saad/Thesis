@@ -60,7 +60,7 @@ else:
     print('💻 Local environment')
 
 if IN_COLAB:
-    OUTPUT_DIR = '/content/drive/MyDrive/thesis/thesis_output/'
+    OUTPUT_DIR = '/content/drive/MyDrive/me/tetra/thesis/thesis_output/'
 elif IN_KAGGLE:
     OUTPUT_DIR = '/kaggle/working/thesis_output/'
 else:
@@ -125,12 +125,12 @@ print(f'  TetGen: {"✅" if HAS_TETGEN else "❌"}')
 # SECTION 3: CONFIGURATION
 # ============================================================
 def _auto_detect_data_dir():
-    for path in ['/content/drive/MyDrive/thesis/4_bonemat_cdb_files',
+    for path in ['/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files',
                  '/kaggle/input/femur-cdb-files', './4_bonemat_cdb_files', '../4_bonemat_cdb_files']:
         if os.path.isdir(path) and len(glob.glob(os.path.join(path, '*.cdb'))) > 0:
             print(f'  📂 Data: {path} ({len(glob.glob(os.path.join(path, "*.cdb")))} CDB files)')
             return path
-    return '/content/drive/MyDrive/thesis/4_bonemat_cdb_files' if IN_COLAB else './4_bonemat_cdb_files'
+    return '/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files' if IN_COLAB else './4_bonemat_cdb_files'
 
 DATA_DIR = _auto_detect_data_dir()
 
@@ -138,21 +138,27 @@ MODEL_CONFIG = {
     'n_surface_pts': 4096,
     'n_interior_pts': 8192,      # template size — close to GT mean (~8937)
     'k_local': 8,                # k-nearest surface points for local conditioning
-    'encoder_dim': 256,          # DGCNN per-point feature dim
-    'global_dim': 512,           # global feature dim (encoder_dim * 2)
-    'hidden_dim': 256,           # decoder MLP hidden dim
+    'encoder_dim': 128,          # DGCNN per-point feature dim (was 256)
+    'global_dim': 256,           # global feature dim = encoder_dim * 2 (was 512)
+    'hidden_dim': 128,           # decoder MLP hidden dim (was 256)
     'batch_size': 4,
     'epochs': 300,
-    'lr': 5e-4,                  # higher LR for smaller model
+    'lr': 3e-4,                  # lower LR for smaller model (was 5e-4)
     'lr_patience': 25,
-    'weight_decay': 1e-4,
+    'weight_decay': 5e-4,        # stronger L2 reg (was 1e-4)
     'chamfer_weight': 1.0,       # CD on predicted positions vs GT interior
     'material_weight': 0.1,      # MSE on materials
     'disp_reg_weight': 0.01,     # Soft L2 penalty on displacement magnitude
+    'smooth_reg_weight': 0.005,  # displacement smoothness between neighbors
     'disp_scale': 0.3,           # Output range ±0.3 (baseline CD ~ 0.18)
     'k_folds': 5,
-    'early_stop_patience': 40,
+    'early_stop_patience': 50,   # model finds best in 15-50 epochs (was 80)
     'dgcnn_k': 20,
+    'encoder_freeze_epoch': 0,   # DISABLED — 294K params + regularization is enough
+    'mixup_alpha': 0.4,          # beta distribution param for PointMixup
+    'mixup_prob': 0.5,           # probability of applying mixup per sample
+    'jitter_std': 0.005,         # surface noise std (was 0.002)
+    'point_dropout': 0.1,        # fraction of surface points to randomly drop
 }
 
 MATERIAL_NORM = {'global_min': None, 'global_max': None}
@@ -654,13 +660,25 @@ def chamfer_distance(pred, target, chunk=512):
     for i in range(0, M, chunk):
         d = (target[:, i:i+chunk].unsqueeze(2) - pred.unsqueeze(1)).pow(2).sum(-1).sqrt()
         min_t2p[:, i:i+chunk] = d.min(2)[0]
-    return (min_p2t.mean(1) + min_t2p.mean(1)).mean()
+    return (min_p2t.mean(1) + min_t2p.mean(1)).mean() / 2  # average (matches eval)
 
 
 class DeformLoss(nn.Module):
-    """Loss = CD(predicted_pos, GT_interior) + MSE(material) + disp_reg.
-    CD handles correspondence automatically. Soft L2 reg prevents displacement explosion.
+    """Loss = CD(predicted_pos, GT_interior) + MSE(material) + disp_reg + smooth_reg.
+    CD handles correspondence automatically. Smooth reg enforces spatial coherence.
     """
+    def __init__(self):
+        super().__init__()
+        self._tpl_nn_idx = None  # cached template neighbor indices
+
+    def _get_template_neighbors(self, template, k=6):
+        """Precompute k-nearest neighbors in template for smoothness loss."""
+        # template: (B, T, 3) — use first batch item (same template for all)
+        tpl = template[0].detach().cpu().numpy()
+        tree = KDTree(tpl)
+        _, idx = tree.query(tpl, k=k+1)  # +1 because self is nearest
+        return torch.tensor(idx[:, 1:], device=template.device)  # (T, k) exclude self
+
     def forward(self, pred_disp, pred_mat, target_pos, target_mat, template):
         # Predicted final positions
         pred_pos = template + pred_disp
@@ -671,12 +689,24 @@ class DeformLoss(nn.Module):
         # Soft L2 displacement regularization — prevents overfitting via wild displacements
         disp_reg = pred_disp.pow(2).mean()
 
+        # Displacement smoothness — neighboring template points should move similarly
+        if self._tpl_nn_idx is None or self._tpl_nn_idx.device != template.device:
+            self._tpl_nn_idx = self._get_template_neighbors(template)
+        nn_idx = self._tpl_nn_idx  # (T, k)
+        B = pred_disp.size(0)
+        # Gather neighbor displacements: (B, T, k, 3)
+        nb_disp = pred_disp[:, nn_idx]  # broadcast: (B, T, k, 3)
+        # Mean squared difference between each point and its neighbors
+        smooth_reg = (nb_disp - pred_disp.unsqueeze(2)).pow(2).mean()
+
         total = (MODEL_CONFIG['chamfer_weight'] * cd
                  + MODEL_CONFIG['material_weight'] * mat_loss
-                 + MODEL_CONFIG['disp_reg_weight'] * disp_reg)
+                 + MODEL_CONFIG['disp_reg_weight'] * disp_reg
+                 + MODEL_CONFIG['smooth_reg_weight'] * smooth_reg)
         return total, {
             'cd': cd.item(), 'mat': mat_loss.item(),
             'disp_mag': pred_disp.detach().norm(dim=-1).mean().item(),
+            'smooth': smooth_reg.item(),
             'total': total.item()
         }
 
@@ -694,8 +724,20 @@ class Trainer:
         self.opt = torch.optim.AdamW(model.parameters(),
                                      lr=MODEL_CONFIG['lr'],
                                      weight_decay=MODEL_CONFIG['weight_decay'])
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.opt, T_max=MODEL_CONFIG['epochs'], eta_min=1e-6)
+        # ReduceLROnPlateau: only DECREASES LR when val plateaus (no disruptive restarts)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.opt, mode='min', factor=0.5, patience=15, min_lr=1e-6)
+        self._encoder_frozen = False
+
+    def _freeze_encoder(self):
+        """Freeze DGCNN encoder weights — only train decoder MLP."""
+        if self._encoder_frozen:
+            return
+        for param in self.model.encoder.parameters():
+            param.requires_grad = False
+        self._encoder_frozen = True
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"    🧊 Encoder frozen — {trainable:,} trainable params remain")
 
     def _run_epoch(self, dl, train=True):
         self.model.train(train)
@@ -725,14 +767,20 @@ class Trainer:
         patience = 0
         best_state = None
         n_params = sum(p.numel() for p in self.model.parameters())
+        freeze_ep = MODEL_CONFIG.get('encoder_freeze_epoch', 0)
         print(f"\n  Fold {self.fold} | Training on {DEVICE} | {n_params:,} params")
+        if freeze_ep > 0:
+            print(f"    Encoder will freeze after epoch {freeze_ep}")
         history = []
         for ep in range(1, MODEL_CONFIG['epochs'] + 1):
+            # Freeze encoder after warmup period
+            if freeze_ep > 0 and ep == freeze_ep + 1:
+                self._freeze_encoder()
             t0 = time.time()
             train_loss, train_cd = self._run_epoch(self.train_dl, train=True)
             with torch.no_grad():
                 val_loss, val_cd = self._run_epoch(self.val_dl, train=False)
-            self.scheduler.step()
+            self.scheduler.step(val_cd)  # ReduceLROnPlateau needs val metric
             lr = self.opt.param_groups[0]['lr']
             history.append({'epoch': ep, 'train_loss': train_loss, 'val_loss': val_loss,
                             'train_cd': train_cd, 'val_cd': val_cd, 'lr': lr})
@@ -920,6 +968,22 @@ class _SubDataset(Dataset):
         target_mat = s['target_mat'].copy()  # NN-mapped material (for template pts)
 
         if self.augment:
+            # --- PointMixup: interpolate with another sample ---
+            if np.random.random() < MODEL_CONFIG.get('mixup_prob', 0.5):
+                j = np.random.randint(0, len(self.samples))
+                s2 = self.samples[j]
+                lam = np.random.beta(MODEL_CONFIG.get('mixup_alpha', 0.4),
+                                     MODEL_CONFIG.get('mixup_alpha', 0.4))
+                # Mix surface (xyz only, recompute normals is too slow — mix normals too)
+                surface = lam * surface + (1 - lam) * s2['surface']
+                # Renormalize mixed normals
+                nrm = np.linalg.norm(surface[:, 3:], axis=1, keepdims=True)
+                surface[:, 3:] /= np.maximum(nrm, 1e-10)
+                # Mix targets
+                target_pos = lam * target_pos + (1 - lam) * s2['target_pos']
+                target_mat = lam * target_mat + (1 - lam) * s2['target_mat']
+
+            # --- Geometric augmentation ---
             R = TemplateDeformDataset._random_rotation()
             sc = 1.0 + np.random.uniform(-0.05, 0.05)
             surface[:, :3] = (surface[:, :3] @ R.T) * sc
@@ -928,10 +992,24 @@ class _SubDataset(Dataset):
             surface[:, 3:] /= np.maximum(nrm, 1e-10)
             template = (template @ R.T) * sc
             target_pos = (target_pos @ R.T) * sc
+
+            # Random flip
             if np.random.random() > 0.5:
                 surface[:, 0] *= -1; surface[:, 3] *= -1
                 template[:, 0] *= -1; target_pos[:, 0] *= -1
-            surface[:, :3] += np.random.randn(*surface[:, :3].shape).astype(np.float32) * 0.002
+
+            # --- Stronger jitter ---
+            jitter_std = MODEL_CONFIG.get('jitter_std', 0.005)
+            surface[:, :3] += np.random.randn(*surface[:, :3].shape).astype(np.float32) * jitter_std
+
+            # --- Random surface point dropout ---
+            drop_rate = MODEL_CONFIG.get('point_dropout', 0.1)
+            if drop_rate > 0:
+                n_pts = surface.shape[0]
+                n_drop = int(n_pts * drop_rate)
+                drop_idx = np.random.choice(n_pts, n_drop, replace=False)
+                keep_idx = np.random.choice(n_pts, n_drop, replace=True)
+                surface[drop_idx] = surface[keep_idx]  # replace dropped with random duplicates
 
         return (torch.tensor(surface, dtype=torch.float32),
                 torch.tensor(template, dtype=torch.float32),
