@@ -50,11 +50,12 @@ MODEL_CONFIG = {
     'n_surface_pts': 4096,
     'n_interior_pts': 8192,
     'k_local': 8,
-    'encoder_dim': 128,          # must match training (was 256)
-    'global_dim': 256,           # must match training (was 512)
-    'hidden_dim': 128,           # must match training (was 256)
+    'encoder_dim': 256,          # must match training
+    'global_dim': 512,           # must match training
+    'hidden_dim': 256,           # must match training
     'dgcnn_k': 20,
     'disp_scale': 0.3,
+    'n_refine_steps': 2,         # must match training
 }
 MATERIAL_NORM = {'global_min': None, 'global_max': None}
 
@@ -156,13 +157,21 @@ class SurfaceToVolumeModel(nn.Module):
         self.decoder = TemplateDeformNet(
             global_dim=cfg['global_dim'], local_dim=cfg['encoder_dim'],
             hidden=cfg['hidden_dim'], k_local=cfg['k_local'])
+        self.n_refine_steps = cfg.get('n_refine_steps', 1)
 
     def forward(self, surface, template):
+        # Encode surface ONCE
         surf_t = surface.transpose(1, 2)
         global_feat, point_feat = self.encoder(surf_t)
         surf_xyz = surface[:, :, :3]
-        disp, mat = self.decoder(template, surf_xyz, global_feat, point_feat)
-        return disp, mat
+        # Iterative refinement (must match training)
+        pos = template.clone()
+        mat = None
+        for step in range(self.n_refine_steps):
+            disp, mat = self.decoder(pos, surf_xyz, global_feat, point_feat)
+            pos = pos + disp
+        total_disp = pos - template
+        return total_disp, mat
 
 # ============================================================
 # CDB READER (same as training)

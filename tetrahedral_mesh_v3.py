@@ -60,7 +60,7 @@ else:
     print('💻 Local environment')
 
 if IN_COLAB:
-    OUTPUT_DIR = '/content/drive/MyDrive/me/tetra/thesis/thesis_output/'
+    OUTPUT_DIR = '/content/drive/MyDrive/thesis/thesis_output/'
 elif IN_KAGGLE:
     OUTPUT_DIR = '/kaggle/working/thesis_output/'
 else:
@@ -125,12 +125,12 @@ print(f'  TetGen: {"✅" if HAS_TETGEN else "❌"}')
 # SECTION 3: CONFIGURATION
 # ============================================================
 def _auto_detect_data_dir():
-    for path in ['/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files',
+    for path in ['/content/drive/MyDrive/thesis/4_bonemat_cdb_files',
                  '/kaggle/input/femur-cdb-files', './4_bonemat_cdb_files', '../4_bonemat_cdb_files']:
         if os.path.isdir(path) and len(glob.glob(os.path.join(path, '*.cdb'))) > 0:
             print(f'  📂 Data: {path} ({len(glob.glob(os.path.join(path, "*.cdb")))} CDB files)')
             return path
-    return '/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files' if IN_COLAB else './4_bonemat_cdb_files'
+    return '/content/drive/MyDrive/thesis/4_bonemat_cdb_files' if IN_COLAB else './4_bonemat_cdb_files'
 
 DATA_DIR = _auto_detect_data_dir()
 
@@ -138,27 +138,28 @@ MODEL_CONFIG = {
     'n_surface_pts': 4096,
     'n_interior_pts': 8192,      # template size — close to GT mean (~8937)
     'k_local': 8,                # k-nearest surface points for local conditioning
-    'encoder_dim': 128,          # DGCNN per-point feature dim (was 256)
-    'global_dim': 256,           # global feature dim = encoder_dim * 2 (was 512)
-    'hidden_dim': 128,           # decoder MLP hidden dim (was 256)
+    'encoder_dim': 256,          # RESTORED — full surface feature capacity
+    'global_dim': 512,           # RESTORED — encoder_dim * 2
+    'hidden_dim': 256,           # RESTORED — full decoder capacity
     'batch_size': 4,
     'epochs': 300,
-    'lr': 3e-4,                  # lower LR for smaller model (was 5e-4)
+    'lr': 5e-4,                  # RESTORED for larger model
     'lr_patience': 25,
-    'weight_decay': 5e-4,        # stronger L2 reg (was 1e-4)
+    'weight_decay': 3e-4,        # L2 reg (balanced: was 1e-4 in V3, 5e-4 in V3.1)
     'chamfer_weight': 1.0,       # CD on predicted positions vs GT interior
     'material_weight': 0.1,      # MSE on materials
     'disp_reg_weight': 0.01,     # Soft L2 penalty on displacement magnitude
     'smooth_reg_weight': 0.005,  # displacement smoothness between neighbors
-    'disp_scale': 0.3,           # Output range ±0.3 (baseline CD ~ 0.18)
+    'disp_scale': 0.3,           # Output range ±0.3 per refinement step
     'k_folds': 5,
-    'early_stop_patience': 50,   # model finds best in 15-50 epochs (was 80)
+    'early_stop_patience': 50,   # model finds best in 15-50 epochs
     'dgcnn_k': 20,
-    'encoder_freeze_epoch': 0,   # DISABLED — 294K params + regularization is enough
+    'encoder_freeze_epoch': 0,   # DISABLED
     'mixup_alpha': 0.4,          # beta distribution param for PointMixup
-    'mixup_prob': 0.5,           # probability of applying mixup per sample
+    'mixup_prob': 0.0,           # DISABLED — harmful for regression
     'jitter_std': 0.005,         # surface noise std (was 0.002)
     'point_dropout': 0.1,        # fraction of surface points to randomly drop
+    'n_refine_steps': 2,         # Iterative refinement: decoder runs N times
 }
 
 MATERIAL_NORM = {'global_min': None, 'global_max': None}
@@ -614,7 +615,11 @@ class TemplateDeformNet(nn.Module):
 
 
 class SurfaceToVolumeModel(nn.Module):
-    """Full model: DGCNN encoder → Template Deformation Network."""
+    """Full model: DGCNN encoder → Iterative Template Deformation.
+    Key innovation: decoder runs N times with shared weights.
+    In step 2+, template points are closer to targets, so k-NN finds
+    more relevant surface neighbors → finer corrections.
+    """
     def __init__(self):
         super().__init__()
         cfg = MODEL_CONFIG
@@ -623,21 +628,28 @@ class SurfaceToVolumeModel(nn.Module):
         self.decoder = TemplateDeformNet(
             global_dim=cfg['global_dim'], local_dim=cfg['encoder_dim'],
             hidden=cfg['hidden_dim'], k_local=cfg['k_local'])
+        self.n_refine_steps = cfg.get('n_refine_steps', 1)
 
     def forward(self, surface, template):
         """
         surface: (B, N_surf, 6) — surface points with normals
         template: (B, N_int, 3) — template positions
-        Returns: displacement (B, N_int, 3), material (B, N_int)
+        Returns: total_displacement (B, N_int, 3), material (B, N_int)
         """
-        # Encode surface
+        # Encode surface ONCE (same features for all refinement steps)
         surf_t = surface.transpose(1, 2)  # (B, 6, N_surf)
-        global_feat, point_feat = self.encoder(surf_t)  # (B, 512), (B, N_surf, 256)
+        global_feat, point_feat = self.encoder(surf_t)
         surf_xyz = surface[:, :, :3]  # (B, N_surf, 3)
 
-        # Decode: predict displacements + materials
-        disp, mat = self.decoder(template, surf_xyz, global_feat, point_feat)
-        return disp, mat
+        # Iterative refinement: decoder runs N times with shared weights
+        pos = template.clone()
+        mat = None
+        for step in range(self.n_refine_steps):
+            disp, mat = self.decoder(pos, surf_xyz, global_feat, point_feat)
+            pos = pos + disp  # update positions for next step
+
+        total_disp = pos - template  # accumulated displacement
+        return total_disp, mat
 
 n_params = sum(p.numel() for p in SurfaceToVolumeModel().parameters())
 print(f'✅ Model verified: {n_params:,} parameters')
@@ -660,7 +672,7 @@ def chamfer_distance(pred, target, chunk=512):
     for i in range(0, M, chunk):
         d = (target[:, i:i+chunk].unsqueeze(2) - pred.unsqueeze(1)).pow(2).sum(-1).sqrt()
         min_t2p[:, i:i+chunk] = d.min(2)[0]
-    return (min_p2t.mean(1) + min_t2p.mean(1)).mean() / 2  # average (matches eval)
+    return (min_p2t.mean(1) + min_t2p.mean(1)).mean()  # sum of both directions
 
 
 class DeformLoss(nn.Module):
