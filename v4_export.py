@@ -5,7 +5,7 @@ Loads trained V4 model, predicts interior points + materials,
 runs TetGen for tet meshing, writes ANSYS CDB files.
 
 Usage (Colab):
-  exec(open('/content/drive/MyDrive/thesis/v4_export.py').read())
+  exec(open('/content/drive/MyDrive/thesis/me/tetra/v4_export.py').read())
 
 Usage (local):
   python v4_export.py --model model_v4_fold3.pt --data ./4_bonemat_cdb_files --output ./v4_output/
@@ -354,9 +354,9 @@ def write_cdb(filepath, nodes, tets, material_values=None, poisson=0.3):
 # ============================================================
 def run_export(model_path=None, data_dir=None, output_dir=None):
     if IN_COLAB:
-        model_path = model_path or '/content/drive/MyDrive/thesis/thesis_output/model_v4_fold1.pt'
-        data_dir = data_dir or '/content/drive/MyDrive/thesis/4_bonemat_cdb_files'
-        output_dir = output_dir or '/content/drive/MyDrive/thesis/thesis_output/v4_export/'
+        model_path = model_path or '/content/drive/MyDrive/thesis/me/tetra/thesis_output/v4_output_1/model_v4_fold1.pt'
+        data_dir = data_dir or '/content/drive/MyDrive/thesis/me/dataset/4_bonemat_cdb_files'
+        output_dir = output_dir or '/content/drive/MyDrive/thesis/me/tetra/thesis_output/v4_export/'
     else:
         model_path = model_path or './thesis_output/model_v4_fold1.pt'
         data_dir = data_dir or './4_bonemat_cdb_files'
